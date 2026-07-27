@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     llm_temperature: float = Field(default=0.1, alias="LLM_TEMPERATURE")
     llm_max_tokens: int = Field(default=800, alias="LLM_MAX_TOKENS")
 
+    hf_token: str = Field(default="", alias="HF_TOKEN")
+
     retrieval_top_k: int = Field(default=5, alias="RETRIEVAL_TOP_K")
     retrieval_candidate_k: int = Field(default=20, alias="RETRIEVAL_CANDIDATE_K")
     enable_reranker: bool = Field(default=True, alias="ENABLE_RERANKER")

@@ -40,6 +40,8 @@ flowchart LR
   LLM --> Chat
 ```
 
+Chunking and retrieval quality criteria (section context, ranking signals, fact-type validation, fixture tests): [docs/CHUNKING_AND_RETRIEVAL.md](docs/CHUNKING_AND_RETRIEVAL.md).
+
 ## Quick start
 
 ### 1. Start Qdrant (preferred)
@@ -108,7 +110,8 @@ Important:
 | `VECTOR_STORE` | `qdrant` (preferred) or `memory` (local fallback) |
 | `QDRANT_URL` | Vector DB URL when using Qdrant |
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | Local sentence-transformers by default (`hash` for tests) |
-| `LLM_PROVIDER` / `LLM_BASE_URL` / `LLM_MODEL` | Qwen-compatible chat model (`deterministic` for tests) |
+| `LLM_PROVIDER` / `LLM_BASE_URL` / `LLM_MODEL` | `ollama` (Qwen), `huggingface` (+ `HF_TOKEN`), or `deterministic` for tests |
+| `HF_TOKEN` | Required when `LLM_PROVIDER=huggingface` (Inference API) |
 | `CORS_ORIGINS` | Allowed browser origins |
 | `ALLOWED_CRAWL_DOMAINS` | Website crawl allowlist |
 

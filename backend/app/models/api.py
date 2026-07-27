@@ -35,6 +35,7 @@ class DocumentChunk(BaseModel):
     document_name: str
     page_number: Optional[int] = None
     section_title: Optional[str] = None
+    subsection_title: Optional[str] = None
     chunk_index: int
     content: str
     content_hash: str
@@ -49,6 +50,10 @@ class DocumentChunk(BaseModel):
     organization: Optional[str] = None
     dates: Optional[str] = None
     location: Optional[str] = None
+    # Universal content typing (key_value, paragraph, list, heading, prompt, …)
+    content_type: Optional[str] = None
+    label: Optional[str] = None
+    value: Optional[str] = None
 
 
 class DocumentSummary(BaseModel):
@@ -65,6 +70,10 @@ class DocumentSummary(BaseModel):
     status: str = "ready"
     uploaded_at: datetime
     errors: List[str] = Field(default_factory=list)
+    primary_entities: List[str] = Field(default_factory=list)
+    universal_chunk_count: int = 0
+    structured_chunk_count: int = 0
+    document_headings: List[str] = Field(default_factory=list)
 
 
 class UploadDocumentResponse(BaseModel):
@@ -102,6 +111,7 @@ class RetrievedChunk(BaseModel):
     score: float
     chunk_id: Optional[str] = None
     section_title: Optional[str] = None
+    subsection_title: Optional[str] = None
     record_id: Optional[str] = None
     record_type: Optional[str] = None
     person_name: Optional[str] = None
@@ -109,6 +119,9 @@ class RetrievedChunk(BaseModel):
     organization: Optional[str] = None
     dates: Optional[str] = None
     location: Optional[str] = None
+    content_type: Optional[str] = None
+    label: Optional[str] = None
+    value: Optional[str] = None
     diagnostics: Optional[Dict[str, Any]] = None
 
 
@@ -145,6 +158,7 @@ class ChatResponse(BaseModel):
     answer: str
     sources: List[CitationSource] = Field(default_factory=list)
     conversation_id: Optional[str] = None
+    diagnostics: Optional[Dict[str, Any]] = None
 
 
 class DocumentListResponse(BaseModel):

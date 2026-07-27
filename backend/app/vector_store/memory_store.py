@@ -70,6 +70,7 @@ class InMemoryVectorStore(VectorStore):
                     "document_name": chunk.document_name,
                     "page_number": chunk.page_number,
                     "section_title": chunk.section_title,
+                    "subsection_title": chunk.subsection_title,
                     "chunk_index": chunk.chunk_index,
                     "content": chunk.content,
                     "content_hash": chunk.content_hash,
@@ -83,6 +84,9 @@ class InMemoryVectorStore(VectorStore):
                     "organization": chunk.organization,
                     "dates": chunk.dates,
                     "location": chunk.location,
+                    "content_type": chunk.content_type,
+                    "label": chunk.label,
+                    "value": chunk.value,
                 },
             }
             existing_hashes.add(key)
@@ -132,6 +136,10 @@ class InMemoryVectorStore(VectorStore):
                     uploaded_at=datetime.fromisoformat(uploaded)
                     if uploaded
                     else datetime.utcnow(),
+                    primary_entities=[],
+                    universal_chunk_count=0,
+                    structured_chunk_count=0,
+                    document_headings=[],
                 )
             summary = documents[document_id]
             summary.chunk_count += 1
@@ -139,6 +147,18 @@ class InMemoryVectorStore(VectorStore):
             page = payload.get("page_number")
             if isinstance(page, int):
                 summary.page_count = max(summary.page_count, page)
+            record_type = str(payload.get("record_type") or "universal")
+            if record_type == "universal":
+                summary.universal_chunk_count += 1
+            else:
+                summary.structured_chunk_count += 1
+            person = payload.get("person_name")
+            if person and str(person) not in summary.primary_entities:
+                summary.primary_entities.append(str(person))
+            heading = payload.get("section_title")
+            if heading and str(heading) not in summary.document_headings:
+                if len(summary.document_headings) < 12:
+                    summary.document_headings.append(str(heading))
         return sorted(documents.values(), key=lambda item: item.uploaded_at, reverse=True)
 
     async def delete_document(self, company_id: str, document_id: str) -> int:
@@ -172,6 +192,7 @@ class InMemoryVectorStore(VectorStore):
                     document_name=str(payload.get("document_name")),
                     page_number=payload.get("page_number"),
                     section_title=payload.get("section_title"),
+                    subsection_title=payload.get("subsection_title"),
                     chunk_index=int(payload.get("chunk_index") or 0),
                     content=str(payload.get("content") or ""),
                     content_hash=str(payload.get("content_hash") or ""),
@@ -187,6 +208,16 @@ class InMemoryVectorStore(VectorStore):
                     organization=payload.get("organization"),
                     dates=payload.get("dates"),
                     location=payload.get("location"),
+                    content_type=payload.get("content_type"),
+                    label=payload.get("label"),
+                    value=payload.get("value"),
                 )
             )
         return sorted(chunks, key=lambda chunk: chunk.chunk_index)
+
+    async def list_payloads(self, company_id: str) -> List[Dict[str, Any]]:
+        return [
+            point["payload"]
+            for point in self._points.values()
+            if point["payload"]["company_id"] == company_id
+        ]

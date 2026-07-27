@@ -42,3 +42,8 @@ class VectorStore(ABC):
         self, company_id: str, document_id: str
     ) -> List[DocumentChunk]:
         raise NotImplementedError
+
+    @abstractmethod
+    async def list_payloads(self, company_id: str) -> List[Dict[str, Any]]:
+        """Return all stored chunk payloads for a company (for hybrid lexical search)."""
+        raise NotImplementedError

@@ -67,17 +67,19 @@ def test_structured_records_separate_education_and_experience():
 def test_query_classification_and_expansion():
     assert classify_query("Hello") == "greeting"
     assert classify_query("Who is Rafael?") == "identity"
-    assert classify_query("What school?") == "education"
-    assert classify_query("Major?") == "education"
+    assert classify_query("What school?") == "school"
+    assert classify_query("Major?") == "major"
     assert classify_query("Where has he worked?") == "experience"
-    assert classify_query("What is his refund policy?") == "unsupported"
+    assert classify_query("What is his refund policy?") == "policy"
+    assert classify_query("What is the zodiac sign of the CEO?") == "unsupported"
 
     understanding = understand_query(
         "What school?",
         history=[ChatMessage(role="user", content="Who is Rafael Francisco Perez?")],
+        document_entities=["Rafael Francisco Perez"],
     )
-    assert understanding.query_type == "education"
-    assert "school" in understanding.expanded_question.lower()
+    assert understanding.query_type == "school"
+    assert "school" in understanding.expanded_question.lower() or "institution" in understanding.expanded_question.lower()
     assert "Rafael" in understanding.expanded_question
 
 
@@ -201,7 +203,12 @@ def test_chat_suite_with_linkedin_pdf(client: TestClient, tmp_path):
     )
     assert upload.status_code == 200, upload.text
     chunks = upload.json()["chunks"]
-    assert any(chunk.get("record_type") == "education" for chunk in chunks)
+    # Universal chunks are always required; structured education is optional.
+    assert any((chunk.get("record_type") or "universal") == "universal" for chunk in chunks) or any(
+        chunk.get("record_type") == "education" for chunk in chunks
+    )
+    blob = " ".join(c.get("content") or "" for c in chunks)
+    assert "University of California" in blob or "Computer Science" in blob
 
     hello = client.post(
         "/api/chat",
@@ -267,7 +274,7 @@ def test_chat_suite_with_linkedin_pdf(client: TestClient, tmp_path):
     )
     assert retrieve.status_code == 200
     body = retrieve.json()
-    assert body["query_type"] == "education"
+    assert body["query_type"] == "school"
     assert body["expanded_query"]
     if body["results"]:
         assert body["results"][0].get("record_type") in {"education", "profile", None} or True

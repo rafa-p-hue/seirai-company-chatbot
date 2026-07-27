@@ -20,19 +20,30 @@ class PdfExtractionError(Exception):
 
 
 def _extract_page_text(page: "fitz.Page") -> str:
-    """Prefer layout-aware text; fall back to block extraction when needed."""
-    text = (page.get_text("text") or "").strip()
-    if text:
-        return text
-
+    """Layout-aware extraction via PyMuPDF blocks, preserving line breaks."""
     blocks = page.get_text("blocks") or []
-    parts: List[str] = []
+    usable: List[tuple[float, float, List[str]]] = []
     for block in blocks:
-        if isinstance(block, (list, tuple)) and len(block) >= 5 and isinstance(block[4], str):
-            fragment = block[4].strip()
-            if fragment:
-                parts.append(fragment)
-    return "\n".join(parts).strip()
+        if not isinstance(block, (list, tuple)) or len(block) < 5:
+            continue
+        x0, y0, _x1, _y1, text = block[0], block[1], block[2], block[3], block[4]
+        if not isinstance(text, str):
+            continue
+        cleaned = text.replace("\u0000", "").replace("\u200b", "").strip()
+        if not cleaned:
+            continue
+        parts = [part.strip() for part in cleaned.split("\n") if part.strip()]
+        if parts:
+            usable.append((float(y0), float(x0), parts))
+
+    if usable:
+        usable.sort(key=lambda item: (round(item[0], 1), round(item[1], 1)))
+        lines: List[str] = []
+        for _, _, parts in usable:
+            lines.extend(parts)
+        return "\n".join(lines).strip()
+
+    return (page.get_text("text") or "").strip()
 
 
 def extract_pdf_pages(path: Path) -> Tuple[List[ExtractedPage], dict]:

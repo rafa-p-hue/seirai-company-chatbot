@@ -27,7 +27,7 @@ async def retrieve(
     retriever: Retriever = Depends(get_retriever),
 ) -> RetrieveResponse:
     company_id = _validate_company_id(request.company_id)
-    results, understanding = await retriever.retrieve(
+    results, understanding, _inspection = await retriever.retrieve(
         company_id=company_id,
         question=request.question,
         top_k=request.top_k,

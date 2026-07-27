@@ -73,27 +73,25 @@ class StructuredRecord:
     page_end: Optional[int] = None
 
     def embedding_text(self) -> str:
-        lines: List[str] = [f"Record type: {self.record_type}"]
+        """Human-readable content for retrieval — no internal scaffold labels."""
+        lines: List[str] = []
         if self.person_name:
-            lines.append(f"Person: {self.person_name}")
+            lines.append(self.person_name)
         if self.title:
-            lines.append(f"Title: {self.title}")
+            lines.append(self.title)
         if self.organization:
-            lines.append(f"Organization: {self.organization}")
+            lines.append(self.organization)
         if self.dates:
-            lines.append(f"Dates: {self.dates}")
+            lines.append(self.dates)
         if self.location:
-            lines.append(f"Location: {self.location}")
-        if self.heading:
-            lines.append(f"Section: {self.heading}")
+            lines.append(self.location)
         if self.employment_type:
-            lines.append(f"Employment type: {self.employment_type}")
+            lines.append(self.employment_type)
         if self.skills:
-            lines.append(f"Skills: {', '.join(self.skills)}")
+            lines.append(", ".join(self.skills))
         if self.description:
-            lines.append("Description:")
             lines.append(self.description)
-        return "\n".join(lines).strip()
+        return "\n".join(line for line in lines if line).strip()
 
     def display_text(self) -> str:
         return self.embedding_text()
@@ -106,6 +104,9 @@ def parse_structured_records(
 ) -> List[StructuredRecord]:
     lines = _flatten_lines(pages)
     if not lines:
+        return []
+    # Skip structured resume parsing for handbook/policy-style documents.
+    if not _looks_like_resume_or_profile(lines):
         return []
 
     person_name = _detect_person_name(lines)
@@ -418,6 +419,48 @@ def _flatten_lines(pages: Sequence[ExtractedPage]) -> List[tuple]:
             if text:
                 lines.append((text, page.page_number))
     return lines
+
+
+def _looks_like_resume_or_profile(lines: Sequence[tuple]) -> bool:
+    """Require classic resume signals before emitting structured records."""
+    blob = "\n".join(text for text, _ in lines[:80]).lower()
+    resume_hits = sum(
+        1
+        for token in (
+            "experience",
+            "education",
+            "skills",
+            "internship",
+            "linkedin",
+            "bachelor",
+            "master",
+            "gpa",
+            "resume",
+            "curriculum vitae",
+        )
+        if token in blob
+    )
+    policy_hits = sum(
+        1
+        for token in (
+            "membership",
+            "refund",
+            "cancellation",
+            "accessibility",
+            "sustainability",
+            "compost",
+            "event rentals",
+            "volunteer program",
+            "policy",
+            "handbook",
+        )
+        if token in blob
+    )
+    if policy_hits >= 3 and resume_hits < 3:
+        return False
+    return resume_hits >= 2 or (
+        _detect_person_name(lines) is not None and resume_hits >= 1
+    )
 
 
 def _is_section_heading(text: str) -> bool:

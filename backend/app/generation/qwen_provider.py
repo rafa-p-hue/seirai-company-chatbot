@@ -9,7 +9,7 @@ import httpx
 from app.config import Settings
 from app.generation.base import LLMProvider
 from app.generation.prompts import FALLBACK_ANSWER, SYSTEM_PROMPT, build_user_prompt
-from app.models.api import ChatMessage, CitationSource, RetrievedChunk, SourceType
+from app.models.api import ChatMessage, CitationSource, RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,11 @@ class QwenCompatibleProvider(LLMProvider):
 
 
 class DeterministicFallbackProvider(LLMProvider):
-    """Used in tests / when no LLM is configured to run."""
+    """Used in tests / when no LLM is configured to run.
+
+    Still routes evidence through a generation path (compose_answer) rather than
+    returning the first retrieved chunk verbatim.
+    """
 
     def __init__(self) -> None:
         self.name = "deterministic-fallback"
@@ -117,43 +121,67 @@ class DeterministicFallbackProvider(LLMProvider):
         if not evidence:
             return FALLBACK_ANSWER, []
 
-        # Refuse when the question is clearly unsupported by retrieved text
-        # (e.g. refund policy questions against a document with no refund content).
-        from app.retrieval.hybrid_search import hybrid_score
+        from app.generation.answer_composer import compose_answer
+        from app.generation.citations import sources_from_answer
+        from app.retrieval.query_understanding import understand_query
 
-        best = max(hybrid_score(question, item.content) for item in evidence)
-        if best < 0.15:
+        # Trust retrieval + fact filtering; do not drop evidence solely due to
+        # weak lexical overlap (e.g. "found" vs "founder").
+        understanding = understand_query(question, history=history)
+        answer, _composed_sources = compose_answer(
+            understanding=understanding, evidence=evidence
+        )
+        if not answer or answer == FALLBACK_ANSWER:
             return FALLBACK_ANSWER, []
 
-        sources = format_sources(evidence)
-        snippets = []
-        for index, item in enumerate(evidence[:3], start=1):
-            snippet = re.sub(r"\s+", " ", item.content).strip()
-            snippets.append(f"{snippet[:240]} [{index}]")
-        answer = " ".join(snippets).strip()
-        return answer or FALLBACK_ANSWER, sources
+        from app.generation.answer_composer import _finalize_answer, _looks_like_raw_chunk_dump
+
+        answer = _finalize_answer(answer)
+        if not answer or answer == FALLBACK_ANSWER or _looks_like_raw_chunk_dump(
+            answer, evidence
+        ):
+            return FALLBACK_ANSWER, []
+
+        # Attach citation markers for the evidence that supports the answer.
+        cited_indices: List[int] = []
+        answer_l = answer.lower()
+        for index, item in enumerate(evidence, start=1):
+            tokens = [
+                token
+                for token in re.findall(r"[a-z0-9]{4,}", item.content.lower())
+                if token
+                not in {"with", "that", "this", "from", "have", "record", "type", "nominee"}
+            ]
+            if any(token in answer_l for token in tokens[:12]):
+                cited_indices.append(index)
+            if len(cited_indices) >= 3:
+                break
+        if cited_indices:
+            markers = " ".join(f"[{n}]" for n in cited_indices)
+            if markers not in answer:
+                answer = f"{answer.rstrip()} {markers}"
+
+        sources = sources_from_answer(
+            answer, evidence, query_type=understanding.query_type
+        )
+        return answer, sources
 
 
 def format_sources(evidence: Sequence[RetrievedChunk]) -> List[CitationSource]:
-    sources: List[CitationSource] = []
-    for index, item in enumerate(evidence, start=1):
-        source_type = SourceType.website if item.source_url else SourceType.pdf
-        sources.append(
-            CitationSource(
-                number=index,
-                document_name=item.document_name,
-                page_number=item.page_number,
-                source_url=item.source_url,
-                source_type=source_type,
-            )
-        )
-    return sources
+    from app.generation.citations import dedupe_sources
+
+    return dedupe_sources(evidence)
 
 
 def create_llm_provider(settings: Settings) -> LLMProvider:
     provider = settings.llm_provider.lower().strip()
     if provider in {"ollama", "qwen", "openai_compatible", "vllm"}:
         return QwenCompatibleProvider(settings)
+    if provider in {"huggingface", "hf", "huggingface_hub"}:
+        if not settings.hf_token.strip():
+            raise ValueError("HF_TOKEN is required when LLM_PROVIDER=huggingface")
+        from app.generation.huggingface_provider import HuggingFaceGenerationProvider
+        return HuggingFaceGenerationProvider(settings)
     if provider in {"deterministic", "fallback", "none"}:
         return DeterministicFallbackProvider()
     raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")

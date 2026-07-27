@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Seirai Widget Test Page</title>
+    <style>
+      body {
+        font-family: Georgia, serif;
+        margin: 0;
+        padding: 48px 24px;
+        background: #f8fafc;
+        color: #0f172a;
+      }
+      main {
+        max-width: 720px;
+        margin: 0 auto;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Host website sample</h1>
+      <p>
+        This page loads the embeddable chatbot widget. Use it while the frontend
+        is running locally.
+      </p>
+    </main>
+    <script
+      src="/widget.js"
+      data-company-id="seirai"
+      data-title="Ask Seirai AI"
+      data-position="bottom-right"
+      defer
+    ></script>
+  </body>
+</html>

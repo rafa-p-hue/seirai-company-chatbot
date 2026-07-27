@@ -1,0 +1,10 @@
+Acme Orchard Labs Company Overview
+
+Services
+Acme Orchard Labs provides inventory automation, analytics dashboards, and integration support for regional retailers.
+
+Contact
+Customers can contact the company by emailing support@acme-orchard.example or calling +1-555-0100 during business hours.
+
+Hours
+Support is available Monday through Friday, 9am to 5pm Eastern Time.

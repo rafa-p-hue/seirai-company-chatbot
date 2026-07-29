@@ -1,0 +1,525 @@
+"""Natural-language answer synthesis from normalized evidence.
+
+Never returns raw retrieval dumps, snake_case field names, or mid-sentence
+fragments as the user-facing answer.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from app.generation.evidence_presentation import (
+    answer_exposes_internal_field_keys,
+    format_structured_content_as_prose,
+    looks_like_answer_fragment,
+    looks_like_structured_record,
+    prepare_evidence_for_generation,
+)
+from app.generation.evidence_validation import (
+    extract_required_items,
+    relevant_price_evidence,
+)
+from app.generation.prompts import FALLBACK_ANSWER
+from app.models.api import RetrievedChunk
+
+logger = logging.getLogger(__name__)
+
+
+DOCUMENT_OBJECT_HINT = re.compile(
+    r"(?i)\b("
+    r"passports?|cards?|forms?|documents?|identification|id\b|bills?|consent|"
+    r"licenses?|certificates?|photos?|proof|agreements?|applications?|"
+    r"seal|my\s+number"
+    r")\b"
+)
+
+
+def extract_checklist_structure(
+    evidence: Sequence[RetrievedChunk],
+) -> List[Dict[str, Any]]:
+    """Typed structured required-item list for prompts and completeness checks.
+
+    Internal shape (never shown to users):
+      {
+        "type": "identity_document" | "certificate" | "form" |
+                "household_document" | "required_document",
+        "required": True,
+        "alternatives": ["item A", "item B"],  # length 1 when no alternative
+        "condition": "when ..." | None,
+        "scope": "all household members" | None,
+        "item": "<primary label>",            # backward-compatible alias
+        "alternative": "<alt or None>",       # backward-compatible alias
+        "evidence_index": 1,
+      }
+    """
+    structured: List[Dict[str, Any]] = []
+    for evidence_index, item in extract_required_items(evidence):
+        text = re.sub(r"\s+", " ", item).strip(" •-")
+        if not text:
+            continue
+        text = re.sub(r"(?i)^or\s+", "", text).strip()
+        alternatives: List[str] = []
+        condition = None
+        scope = None
+
+        household_alt = re.search(
+            r"(?i)^(.+?),\s*or\s+(.+?)\s+(for all(?:\s+household)?\s+members.*)$",
+            text,
+        ) or re.search(
+            r"(?i)^(.+?)\s+or\s+(.+?)\s+(for all(?:\s+household)?\s+members.*)$",
+            text,
+        )
+        if household_alt and len(household_alt.group(1).split()) <= 12:
+            alternatives = [
+                household_alt.group(1).strip(" ,"),
+                household_alt.group(2).strip(" ,"),
+            ]
+            scope = _clean_scope_text(household_alt.group(3))
+            text = alternatives[0]
+        else:
+            alt_match = re.search(
+                r"(?i)^(.+?),\s*or\s+(.+?)(?:\s+(when|if|only if)\s+(.+))?$",
+                text,
+            )
+            if not alt_match:
+                alt_match = re.search(
+                    r"(?i)^(.+?)\s+or\s+(.+?)(?:\s+(when|if|only if)\s+(.+))?$",
+                    text,
+                )
+            if alt_match and len(alt_match.group(1).split()) <= 12:
+                alternatives = [
+                    alt_match.group(1).strip(" ,"),
+                    alt_match.group(2).strip(" ,"),
+                ]
+                text = alternatives[0]
+                if alt_match.lastindex and alt_match.lastindex >= 4 and alt_match.group(4):
+                    condition = f"{alt_match.group(3)} {alt_match.group(4)}".strip()
+            else:
+                alternatives = [text]
+
+        if not condition and not scope:
+            probe = alternatives[0] if alternatives else text
+            cond_match = re.search(
+                r"(?i)^(.+?)(?:,\s*)?(only if|when|if|for)\s+(.+)$",
+                probe,
+            )
+            if cond_match:
+                trailing = cond_match.group(3).strip()
+                if re.search(r"(?i)\b(household|all members)\b", trailing) and re.match(
+                    r"(?i)^for\b", cond_match.group(2)
+                ):
+                    scope = _clean_scope_text(
+                        f"{cond_match.group(2)} {trailing}"
+                    )
+                    if not re.search(r"(?i)\bhousehold\b", probe):
+                        alternatives[0] = cond_match.group(1).strip(" ,")
+                elif len(trailing.split()) <= 14:
+                    alternatives[0] = cond_match.group(1).strip(" ,")
+                    condition = f"{cond_match.group(2)} {trailing}".strip()
+
+        # Household scope embedded in the item text without an alt split.
+        if not scope:
+            scope_match = re.search(
+                r"(?i)^(.*?)\s*(?:,\s*)?(for all(?:\s+household)?\s+members.*)$",
+                alternatives[0],
+            )
+            if scope_match and DOCUMENT_OBJECT_HINT.search(scope_match.group(1) or ""):
+                # Only peel scope when the left side still looks like a document.
+                left = scope_match.group(1).strip(" ,")
+                if left and len(left.split()) <= 12:
+                    alternatives[0] = left
+                    scope = _clean_scope_text(scope_match.group(2))
+
+        alternatives = [a for a in alternatives if a]
+        for i, alt in enumerate(alternatives):
+            cleaned = alt.strip(" ,")
+            if cleaned and cleaned[0].islower() and i == 0:
+                cleaned = cleaned[0].upper() + cleaned[1:]
+            alternatives[i] = cleaned
+        if not alternatives:
+            continue
+
+        primary = alternatives[0]
+        item_type = _classify_checklist_type(
+            primary=primary,
+            alternatives=alternatives,
+            condition=condition,
+            scope=scope,
+        )
+        structured.append(
+            {
+                "type": item_type,
+                "required": True,
+                "alternatives": alternatives,
+                "condition": condition,
+                "scope": scope,
+                # Backward-compatible fields used by older helpers/tests.
+                "item": primary,
+                "alternative": alternatives[1] if len(alternatives) > 1 else None,
+                "evidence_index": evidence_index,
+            }
+        )
+    return structured
+
+
+def _clean_scope_text(raw: str | None) -> str | None:
+    """Keep household scope; drop glued office-hours / weekday noise."""
+    text = re.sub(r"\s+", " ", (raw or "")).strip(" ,.")
+    if not text:
+        return None
+    text = re.split(
+        r"(?i)\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+        r"office hours?|closed)\b",
+        text,
+        maxsplit=1,
+    )[0].strip(" ,.")
+    return text or None
+
+
+def _classify_checklist_type(
+    *,
+    primary: str,
+    alternatives: Sequence[str],
+    condition: Optional[str],
+    scope: Optional[str],
+) -> str:
+    blob = " ".join(
+        part
+        for part in (
+            primary,
+            " ".join(alternatives),
+            condition or "",
+            scope or "",
+        )
+        if part
+    )
+    if scope or re.search(r"(?i)\b(household|all members)\b", blob):
+        return "household_document"
+    if re.search(r"(?i)\b(certificates?|moving-?out)\b", blob):
+        return "certificate"
+    if re.search(r"(?i)\b(forms?|consent|application)\b", blob):
+        return "form"
+    if re.search(
+        r"(?i)\b(passports?|cards?|identification|identity|id\b|my\s+number)\b",
+        blob,
+    ):
+        return "identity_document"
+    return "required_document"
+
+
+def synthesize_checklist_answer(
+    evidence: Sequence[RetrievedChunk],
+) -> str:
+    """Clean checklist prose/bullets — never raw passage fragments."""
+    items = extract_checklist_structure(evidence)
+    if not items:
+        return FALLBACK_ANSWER
+    lines = ["Bring the following:"]
+    for entry in items:
+        piece = format_checklist_item_phrase(entry)
+        if piece and piece[0].islower():
+            piece = piece[0].upper() + piece[1:]
+        lines.append(f"- {piece} [{entry['evidence_index']}]")
+    answer = "\n".join(lines)
+    if answer_exposes_internal_field_keys(answer) or looks_like_answer_fragment(answer):
+        return FALLBACK_ANSWER
+    # Never leave deadline/procedure padding in the user-facing checklist.
+    from app.generation.evidence_validation import strip_checklist_deadline_padding
+
+    return strip_checklist_deadline_padding(answer)
+
+
+def format_checklist_item_phrase(entry: Dict[str, Any]) -> str:
+    alts = entry.get("alternatives")
+    if isinstance(alts, list) and alts:
+        piece = " or ".join(str(a).strip() for a in alts if str(a).strip())
+    else:
+        piece = str(entry.get("item") or "").strip()
+        if entry.get("alternative"):
+            piece = f"{piece} or {entry['alternative']}"
+    condition = entry.get("condition")
+    scope = entry.get("scope")
+    if condition:
+        cond = str(condition)
+        if cond.lower() not in piece.lower():
+            if re.match(r"(?i)^(when|if|only if|for)\b", cond):
+                piece = f"{piece}, {cond}"
+            else:
+                piece = f"{piece} ({cond})"
+    if scope:
+        scope_text = str(scope)
+        if scope_text.lower() not in piece.lower():
+            if re.match(r"(?i)^for\b", scope_text):
+                piece = f"{piece}, {scope_text}"
+            else:
+                piece = f"{piece} ({scope_text})"
+    return re.sub(r"(?i)^(a|an|the)\s+", "", piece).strip()
+
+
+def missing_checklist_items(
+    answer: str, evidence: Sequence[RetrievedChunk]
+) -> List[Dict[str, Any]]:
+    """Return structured required items not covered by the answer."""
+    structure = extract_checklist_structure(evidence)
+    if not structure:
+        return []
+    missing: List[Dict[str, Any]] = []
+    for entry in structure:
+        if not checklist_structure_is_covered(answer, [entry]):
+            missing.append(entry)
+    return missing
+
+
+def checklist_regeneration_instruction(
+    evidence: Sequence[RetrievedChunk], answer: str
+) -> str:
+    """Explicit regeneration instruction listing every missing required item."""
+    missing = missing_checklist_items(answer, evidence)
+    structure = extract_checklist_structure(evidence)
+    targets = missing or structure
+    lines = [format_checklist_item_phrase(entry) for entry in targets if entry]
+    lines = [line for line in lines if line]
+    if not lines:
+        return (
+            "Include every explicitly required document or item from the evidence. "
+            "Preserve alternatives, conditions, and household-wide requirements. "
+            "Include each required item exactly once. "
+            "Do not replace missing items with deadline or location information."
+        )
+    return (
+        "Your previous answer was incomplete. Include ALL of these required items "
+        "exactly once (paraphrase is fine; keep exact document names, alternatives, "
+        "conditions, and household scope). Do not omit any item, and do not replace "
+        "missing items with deadline or location information:\n"
+        + "\n".join(f"- {line}" for line in lines)
+    )
+
+
+def synthesize_fee_answer(
+    question: str, evidence: Sequence[RetrievedChunk]
+) -> str:
+    """Natural-language fee facts — never snake_case CSV dumps."""
+    selected = relevant_price_evidence(question, evidence)
+    if not selected:
+        return FALLBACK_ANSWER
+    lines: List[str] = []
+    seen = set()
+    for evidence_index, chunk in selected:
+        raw = chunk.content or ""
+        if looks_like_structured_record(raw, chunk):
+            prose = format_structured_content_as_prose(raw, chunk)
+        else:
+            prose = format_structured_content_as_prose(raw, chunk)
+            if prose == raw and answer_exposes_internal_field_keys(raw):
+                continue
+            if not looks_like_structured_record(raw, chunk):
+                # Plain currency sentence already in evidence.
+                prose = re.sub(r"\s+", " ", raw).strip()
+        prose = re.sub(r"\s+", " ", prose).strip()
+        if not prose or answer_exposes_internal_field_keys(prose):
+            continue
+        if looks_like_answer_fragment(prose):
+            continue
+        fingerprint = re.sub(r"\W+", " ", prose.lower()).strip()
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        if not prose.endswith((".", "!", "?")):
+            prose += "."
+        lines.append(f"{prose} [{evidence_index}]")
+    if not lines:
+        return FALLBACK_ANSWER
+    if len(lines) == 1:
+        return lines[0]
+    return "\n".join(f"- {line}" for line in lines)
+
+
+def checklist_structure_is_covered(
+    answer: str, structure: Sequence[Dict[str, Any]]
+) -> bool:
+    if not structure:
+        return False
+    answer_l = re.sub(r"\W+", " ", (answer or "").lower())
+    for entry in structure:
+        alts = entry.get("alternatives")
+        if isinstance(alts, list) and alts:
+            item = str(alts[0])
+            alternative = str(alts[1]) if len(alts) > 1 else None
+        else:
+            item = entry.get("item") or ""
+            alternative = entry.get("alternative")
+        tokens = [
+            t
+            for t in re.findall(r"[a-z0-9]{3,}", item.lower())
+            if t
+            not in {
+                "the",
+                "and",
+                "for",
+                "all",
+                "with",
+                "your",
+                "from",
+                "when",
+                "moving",
+                "another",
+            }
+        ]
+        if not tokens:
+            continue
+        hits = sum(1 for t in tokens if t in answer_l)
+        if hits < max(1, (len(tokens) + 1) // 2):
+            compact = re.sub(r"\W+", " ", item.lower()).strip()
+            words = compact.split()
+            found = False
+            for size in (3, 2):
+                for i in range(0, max(0, len(words) - size + 1)):
+                    phrase = " ".join(words[i : i + size])
+                    if phrase in answer_l:
+                        found = True
+                        break
+                if found:
+                    break
+            if not found:
+                return False
+        if alternative:
+            alt = alternative.lower()
+            alt_tokens = re.findall(r"[a-z0-9]{4,}", alt)
+            if alt_tokens and not any(t in answer_l for t in alt_tokens[:3]):
+                if " or " not in f" {answer_l} ":
+                    return False
+        condition = entry.get("condition") or ""
+        scope = entry.get("scope") or ""
+        if condition:
+            cond_l = condition.lower()
+            if re.search(r"(?i)\bonly if\b", cond_l):
+                if "only if" not in answer_l and "if " not in f" {answer_l} ":
+                    return False
+            elif re.search(r"(?i)^when\b", cond_l):
+                when_tokens = [
+                    t
+                    for t in re.findall(r"[a-z0-9]{4,}", cond_l)
+                    if t not in {"when", "from", "another"}
+                ]
+                if when_tokens and not any(t in answer_l for t in when_tokens[:2]):
+                    return False
+        if scope or re.search(r"(?i)\bhousehold\b", condition):
+            if (
+                "household" not in answer_l
+                and "all members" not in answer_l
+                and "each member" not in answer_l
+            ):
+                return False
+    return True
+
+
+def is_retrieval_dump_answer(answer: str) -> bool:
+    """Detect answers that are clearly pasted retrieval / record dumps."""
+    text = (answer or "").strip()
+    if not text:
+        return True
+    if answer_exposes_internal_field_keys(text):
+        return True
+    if re.search(
+        r"(?i)^applicable fees:\s*[-•].*(certificate_or_service|fee_jpy|where_to_apply)",
+        text,
+    ):
+        return True
+    if re.search(
+        r"(?i)\b(certificate_or_service|fee_jpy|where_to_apply)\s*:",
+        text,
+    ):
+        return True
+    # Heading glued to body without punctuation.
+    if re.match(
+        r"(?i)^(?:moving in|move-in notification|national health)[^(]{0,40}\)\s+If\b",
+        text,
+    ):
+        return True
+    if looks_like_answer_fragment(text):
+        return True
+    return False
+
+
+def normalize_evidence_bundle(
+    evidence: Sequence[RetrievedChunk],
+    *,
+    question: str = "",
+) -> Tuple[List[RetrievedChunk], Dict[str, Any]]:
+    """Full evidence normalization + diagnostics for generation."""
+    from app.generation.evidence_presentation import (
+        merge_procedure_evidence,
+        repair_passage_text,
+    )
+
+    diagnostics: Dict[str, Any] = {
+        "selected_chunk_ids": [
+            getattr(c, "chunk_id", None) or f"{c.document_name}:{c.page_number}:{c.score}"
+            for c in evidence
+        ],
+        "chunk_boundary_flags": [],
+        "merged_siblings": [],
+        "checklist_structure": [],
+        "fee_rows_normalized": [],
+    }
+    for chunk in evidence:
+        text = chunk.content or ""
+        diagnostics["chunk_boundary_flags"].append(
+            {
+                "document_name": chunk.document_name,
+                "section_title": chunk.section_title,
+                "starts_on_boundary": bool(
+                    text and (text[0].isupper() or text[0] in "•-\"“'")
+                ),
+                "ends_on_boundary": bool(
+                    text.rstrip().endswith((".", "!", "?", ":", ";"))
+                    or text.rstrip().endswith(("•",))
+                ),
+                "preview": " ".join(text.split())[:120],
+            }
+        )
+
+    merged = merge_procedure_evidence(evidence)
+    if len(merged) < len(evidence):
+        diagnostics["merged_siblings"] = [
+            {
+                "document_name": c.document_name,
+                "section_title": c.section_title,
+                "length": len(c.content or ""),
+            }
+            for c in merged
+        ]
+
+    prepared: List[RetrievedChunk] = []
+    for chunk in merged:
+        content = repair_passage_text(
+            chunk.content or "",
+            section_title=chunk.section_title,
+        )
+        if looks_like_structured_record(content, chunk):
+            prose = format_structured_content_as_prose(content, chunk)
+            diagnostics["fee_rows_normalized"].append(
+                {
+                    "document_name": chunk.document_name,
+                    "row_number": chunk.row_number,
+                    "internal_preview": " ".join((chunk.content or "").split())[:160],
+                    "normalized": prose,
+                }
+            )
+            content = prose
+        prepared.append(chunk.model_copy(update={"content": content}))
+
+    # Second pass via shared prepare for consistency.
+    prepared = prepare_evidence_for_generation(prepared, question=question)
+    diagnostics["checklist_structure"] = extract_checklist_structure(prepared)
+    diagnostics["final_clean_evidence"] = [
+        {
+            "document_name": c.document_name,
+            "section_title": c.section_title,
+            "content": (c.content or "")[:400],
+        }
+        for c in prepared
+    ]
+    return prepared, diagnostics

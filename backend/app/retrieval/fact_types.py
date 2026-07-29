@@ -97,6 +97,10 @@ FACT_TYPE_PATTERNS = {
 def detect_fact_type(question: str, query_type: str) -> str:
     """Map a question to a strict fact type used for evidence gating."""
     lower = (question or "").lower()
+    from app.generation.evidence_validation import is_checklist_question
+
+    if query_type == "checklist" or is_checklist_question(lower):
+        return "checklist"
     if re.search(
         r"\b(what (?:group|organization|club).+(?:found|establish)|"
         r"(?:group|organization|club).+(?:found|establish)|"
@@ -215,6 +219,39 @@ def evidence_matches_fact_type(content: str, fact_type: str, chunk: RetrievedChu
         from app.retrieval.numeric_facts import content_has_currency
 
         return content_has_currency(text)
+    if fact_type == "checklist":
+        from app.generation.evidence_validation import (
+            REQUIRED_CONTEXT_RE,
+            extract_required_items,
+        )
+        from app.retrieval.checklist_assembly import is_requirement_sibling_payload
+
+        # Prefer extractable checklist items from any content type (lists or
+        # fused procedural prose). Do not hard-filter on content_type alone.
+        if chunk is not None:
+            if extract_required_items([chunk]):
+                return True
+            blob = "\n".join(
+                part
+                for part in (
+                    text,
+                    getattr(chunk, "section_title", None) or "",
+                    getattr(chunk, "subsection_title", None) or "",
+                )
+                if part
+            )
+            if REQUIRED_CONTEXT_RE.search(blob):
+                return True
+            # Trailing same-section bullets often omit "bring/required" wording
+            # but still complete the checklist (certificate, household docs).
+            payload = {
+                "content": text,
+                "section_title": getattr(chunk, "section_title", None),
+                "subsection_title": getattr(chunk, "subsection_title", None),
+                "content_type": getattr(chunk, "content_type", None),
+            }
+            return is_requirement_sibling_payload(payload)
+        return bool(REQUIRED_CONTEXT_RE.search(text))
     if fact_type == "quantity":
         from app.retrieval.numeric_facts import content_has_quantity
 
@@ -229,10 +266,26 @@ def evidence_matches_fact_type(content: str, fact_type: str, chunk: RetrievedChu
     if fact_type == "policy":
         from app.retrieval.numeric_facts import content_has_policy_rule
 
-        return content_has_policy_rule(text) or bool(
+        blob = text
+        if chunk is not None:
+            parts = [text]
+            if chunk.section_title:
+                parts.append(str(chunk.section_title))
+            if chunk.subsection_title:
+                parts.append(str(chunk.subsection_title))
+            blob = "\n".join(parts)
+        # Bare heading-only chunks are metadata anchors, not policy answers.
+        if chunk is not None and str(chunk.content_type or "") == "heading":
+            if len((text or "").split()) <= 6:
+                return False
+        return content_has_policy_rule(blob) or bool(
             re.search(
-                r"(?i)\b(membership|volunteer|compost|refund|cancel|rental|pet)\b",
-                text,
+                r"(?i)\b("
+                r"membership|volunteer|compost|refund|cancel|rental|pet|"
+                r"leave|pto|vacation|time\s+off|remote\s+work|handbook|"
+                r"employees?\s+(?:receive|may|must|shall)|days?\s+of\s+"
+                r")\b",
+                blob,
             )
         )
     if fact_type == "accessibility":
@@ -319,6 +372,7 @@ def filter_evidence_for_fact(
         "date",
         "policy",
         "accessibility",
+        "checklist",
     }
     if fact_type in strict_types:
         matched = [
@@ -385,6 +439,7 @@ def answer_matches_fact_type(
         "date",
         "policy",
         "accessibility",
+        "checklist",
     }:
         if UNRELATED_IDENTITY_RE.match(answer.strip()):
             return False
@@ -394,9 +449,11 @@ def answer_matches_fact_type(
     if fact_type == "price":
         from app.retrieval.numeric_facts import content_has_currency
 
-        return content_has_currency(answer) or any(
-            content_has_currency(e.content) for e in evidence
-        )
+        return content_has_currency(answer)
+    if fact_type == "checklist":
+        from app.generation.evidence_validation import checklist_answer_is_complete
+
+        return checklist_answer_is_complete(answer, evidence)
     if fact_type == "quantity":
         from app.retrieval.numeric_facts import content_has_quantity
 
@@ -406,16 +463,18 @@ def answer_matches_fact_type(
     if fact_type == "date":
         from app.retrieval.numeric_facts import (
             content_has_date_or_period,
+            content_has_deadline,
             content_states_unannounced,
         )
 
-        return (
-            content_has_date_or_period(answer)
+        # The answer itself must carry the temporal fact — never accept a bare
+        # title/heading because some other evidence chunk happened to contain a date.
+        if _looks_like_heading_only_answer(answer):
+            return False
+        return bool(
+            content_has_deadline(answer)
+            or content_has_date_or_period(answer)
             or content_states_unannounced(answer)
-            or any(
-                content_has_date_or_period(e.content) or content_states_unannounced(e.content)
-                for e in evidence
-            )
         )
     if fact_type == "policy":
         from app.retrieval.numeric_facts import content_has_policy_rule
@@ -493,6 +552,27 @@ def answer_matches_fact_type(
     if fact_type == "leadership":
         return bool(LEADERSHIP_TITLE_RE.search(answer))
     return not bool(UNRELATED_IDENTITY_RE.match(answer.strip()))
+
+
+def _looks_like_heading_only_answer(answer: str) -> bool:
+    text = re.sub(r"\s+", " ", (answer or "").strip())
+    if not text:
+        return True
+    # Strip trailing citation markers for the shape check.
+    text = re.sub(r"(?:\s*\[\d+\])+\s*$", "", text).strip()
+    words = text.split()
+    if len(words) <= 8 and not re.search(r"[.!?]", text):
+        if not re.search(
+            r"(?i)\b(within|before|after|days?|weeks?|months?|deadline|due)\b",
+            text,
+        ):
+            return True
+    if re.fullmatch(
+        r"(?i)[A-Z][A-Za-z0-9 /&-]{2,80}",
+        text,
+    ) and not re.search(r"(?i)\b(within|must|days?)\b", text):
+        return True
+    return False
 
 
 def _value_from_evidence(evidence: Sequence[RetrievedChunk], families: Sequence[str]) -> Optional[str]:

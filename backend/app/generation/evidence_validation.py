@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from app.generation.prompts import FALLBACK_ANSWER
 from app.models.api import RetrievedChunk
@@ -181,9 +181,32 @@ def extract_required_items(
         )
         has_requirement_context = bool(REQUIRED_CONTEXT_RE.search(context))
         if is_list and not has_requirement_context:
-            # A bullet list is not inherently a checklist. Hours, closures,
-            # contacts, and unrelated lists must not become required items.
-            continue
+            # Same-document sibling bullets often omit "bring/required" wording
+            # after an earlier checklist intro was already selected. If ANY
+            # evidence chunk for this pass already carries requirement context
+            # in the same document, keep these list items.
+            sibling_context = False
+            doc_name = (chunk.document_name or "").strip().lower()
+            for other in evidence:
+                if (other.document_name or "").strip().lower() != doc_name:
+                    continue
+                other_blob = "\n".join(
+                    value
+                    for value in (
+                        other.section_title or "",
+                        other.subsection_title or "",
+                        other.content or "",
+                    )
+                    if value
+                )
+                if REQUIRED_CONTEXT_RE.search(other_blob):
+                    sibling_context = True
+                    break
+            if not sibling_context:
+                # A bullet list is not inherently a checklist. Hours, closures,
+                # contacts, and unrelated lists must not become required items.
+                continue
+            has_requirement_context = True
         bullet_items_present = any(LIST_MARKER_RE.match(line) for line in lines)
         for line in lines:
             marked = bool(LIST_MARKER_RE.match(line))
@@ -500,20 +523,63 @@ def relevant_price_evidence(
 ) -> List[Tuple[int, RetrievedChunk]]:
     from app.ingestion.document_status import question_wants_historical
     from app.generation.evidence_presentation import extract_currency_amounts
-    from app.retrieval.numeric_facts import content_has_currency
+    from app.retrieval.numeric_facts import content_has_currency, PERCENT_RE
+
+    salary_question = bool(
+        re.search(r"(?i)\b(salary|salaries|compensation|pay\s+range)\b", question or "")
+    )
 
     currency_chunks = [
         (index, chunk)
         for index, chunk in enumerate(evidence, start=1)
         if content_has_currency(chunk.content or "")
         or extract_currency_amounts(chunk.content or "")
+        or PERCENT_RE.search(chunk.content or "")
+        or (
+            salary_question
+            and re.search(
+                r"(?i)\b(salary_range|salary|sgd|usd|gbp|aud|compensation)\b",
+                chunk.content or "",
+            )
+        )
     ]
     if not currency_chunks:
         return []
     historical = question_wants_historical(question)
+    requested_age = _extract_requested_age(question)
+
+    # For salary/job questions, require strong title + location match when asked.
+    requested_title = ""
+    requested_location = ""
+    salary_role = re.search(
+        r"(?i)\b(?:salary(?:\s+range)?|compensation|pay\s+range)\s+for\s+(?:the\s+)?"
+        r"(.+?)\s+(?:job|role|position)(?:\s+in\s+([A-Za-z][A-Za-z .'-]{1,40}))?",
+        question or "",
+    )
+    if salary_role:
+        requested_title = (salary_role.group(1) or "").strip(" .")
+        requested_location = (salary_role.group(2) or "").strip(" .?")
+    if salary_question and not requested_location:
+        loc_only = re.search(
+            r"(?i)\b(?:job|role|position)\s+in\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})\b",
+            question or "",
+        )
+        if loc_only:
+            requested_location = loc_only.group(1).strip()
+    if salary_question and not requested_title:
+        # Fallback: capture "DevOps Engineer" style phrases before "in <place>".
+        loose = re.search(
+            r"(?i)\b(?:the\s+)?([A-Z][A-Za-z0-9/+&. -]{2,60}?)\s+"
+            r"(?:job|role|position)\s+in\s+",
+            question or "",
+        )
+        if loose:
+            requested_title = loose.group(1).strip()
+
     scored: List[Tuple[float, int, RetrievedChunk]] = []
     for index, chunk in currency_chunks:
-        term_scores = query_term_scores(question, chunk.content or "")
+        content = chunk.content or ""
+        term_scores = query_term_scores(question, content)
         score = max(term_scores.values(), default=0.0)
         if chunk.content_type in {"table", "structured_table_row"}:
             score += 0.2
@@ -526,6 +592,27 @@ def relevant_price_evidence(
                 score += 0.55
             elif status == "archived":
                 score -= 0.8
+        if requested_age is not None:
+            age_score = _age_bracket_match_score(content, requested_age)
+            score += age_score
+        if salary_question:
+            content_l = content.lower()
+            if requested_title:
+                title_tokens = [
+                    t
+                    for t in re.findall(r"[a-z0-9]+", requested_title.lower())
+                    if len(t) > 2
+                ]
+                if title_tokens and all(t in content_l for t in title_tokens):
+                    score += 1.2
+                elif title_tokens:
+                    score -= 1.5
+            if requested_location:
+                loc = requested_location.lower()
+                if loc in content_l:
+                    score += 0.8
+                else:
+                    score -= 1.0
         scored.append((score, index, chunk))
     best = max(score for score, _, _ in scored)
     selected = [
@@ -533,6 +620,18 @@ def relevant_price_evidence(
         for score, index, chunk in scored
         if score > 0 and score >= best - 0.35
     ]
+    if salary_question and requested_title:
+        tight = []
+        title_tokens = [
+            t for t in re.findall(r"[a-z0-9]+", requested_title.lower()) if len(t) > 2
+        ]
+        for index, chunk in selected:
+            content_l = (chunk.content or "").lower()
+            if title_tokens and all(t in content_l for t in title_tokens):
+                if not requested_location or requested_location.lower() in content_l:
+                    tight.append((index, chunk))
+        if tight:
+            selected = tight
     if not historical:
         current_only = [
             item
@@ -541,7 +640,113 @@ def relevant_price_evidence(
         ]
         if current_only:
             selected = current_only
-    return selected or [(index, chunk) for _, index, chunk in scored[:1]]
+    if requested_age is not None:
+        age_matched = [
+            item
+            for item in selected
+            if _age_bracket_match_score(item[1].content or "", requested_age) >= 0.8
+        ]
+        if age_matched:
+            selected = age_matched
+    # Never fall back to an unrelated top currency row when nothing matched the
+    # requested service terms — that path produced wrong Koseki/certificate fees.
+    if not selected:
+        return []
+    # Extra entity gate: when the question names a service, drop currency-only
+    # mismatches even if term scoring was noisy.
+    from app.retrieval.entity_validation import (
+        collect_named_service_fee_evidence,
+        evidence_matches_requested_entity,
+        extract_requested_service_phrases,
+        service_phrases_for_matching,
+    )
+
+    if service_phrases_for_matching(extract_requested_service_phrases(question)):
+        entity_ok = [
+            item
+            for item in selected
+            if evidence_matches_requested_entity(
+                item[1].content or "",
+                question,
+                section_title=item[1].section_title or "",
+                document_name=item[1].document_name or "",
+            )
+        ]
+        if entity_ok:
+            return entity_ok
+        # Fee schedules often split "Service: X" from "Fee: N%" across chunks.
+        block = collect_named_service_fee_evidence(evidence, question)
+        if not block:
+            return []
+        block_keys = {
+            (c.document_name, (c.content or "")[:160]) for c in block
+        }
+        sibling_ok = [
+            item
+            for item in selected
+            if (item[1].document_name, (item[1].content or "")[:160]) in block_keys
+        ]
+        if sibling_ok:
+            return sibling_ok
+        # Rebuild from the recovered block when selected rows lacked entity text.
+        rebuilt: List[Tuple[int, RetrievedChunk]] = []
+        for chunk in block:
+            if not (
+                content_has_currency(chunk.content or "")
+                or extract_currency_amounts(chunk.content or "")
+                or PERCENT_RE.search(chunk.content or "")
+            ):
+                continue
+            # Preserve original 1-based indexes when possible.
+            try:
+                index = next(
+                    i
+                    for i, c in enumerate(evidence, start=1)
+                    if c is chunk
+                    or (
+                        c.document_name == chunk.document_name
+                        and (c.content or "")[:160] == (chunk.content or "")[:160]
+                    )
+                )
+            except StopIteration:
+                index = len(rebuilt) + 1
+            rebuilt.append((index, chunk))
+        return rebuilt
+    return selected
+
+
+def _extract_requested_age(question: str) -> Optional[int]:
+    match = re.search(
+        r"(?i)\b(\d{1,2})\s*[- ]?\s*year(?:s)?(?:\s*|-)?old\b|"
+        r"\b(\d{1,2})\s*yo\b|"
+        r"\bage(?:d)?\s+(\d{1,2})\b",
+        question or "",
+    )
+    if not match:
+        return None
+    raw = match.group(1) or match.group(2) or match.group(3)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _age_bracket_match_score(content: str, age: int) -> float:
+    """Score how well content's age ranges cover the requested age."""
+    text = content or ""
+    best = 0.0
+    # Explicit "2-year-old" / "for a 2-year-old"
+    if re.search(rf"(?i)\b{age}\s*[- ]?\s*year(?:s)?(?:\s*|-)?old\b", text):
+        best = max(best, 1.2)
+    # Ranges like "ages 3 to 12" / "3-12"
+    for match in re.finditer(
+        r"(?i)\b(?:aged?\s+)?(\d{1,2})\s*(?:to|-|–|—)\s*(\d{1,2})\b",
+        text,
+    ):
+        low, high = int(match.group(1)), int(match.group(2))
+        if low <= age <= high:
+            best = max(best, 1.0)
+    return best
 
 
 def price_answer(question: str, evidence: Sequence[RetrievedChunk]) -> str:
@@ -577,7 +782,24 @@ def price_answer_is_complete(
     if not required:
         return False
     expected: set[str] = set()
+    pct_expected: set[str] = set()
     for _, chunk in required:
-        expected |= extract_currency_amounts(chunk.content or "")
+        text = chunk.content or ""
+        amounts = extract_currency_amounts(text)
+        expected |= amounts
+        if re.search(r"\d{1,3}(?:\.\d+)?\s*%", text) and not re.search(
+            r"(?i)minimum\s+fee", text
+        ):
+            pct_expected |= {
+                a for a in amounts if re.search(rf"(?i)\b{re.escape(a)}\s*%", text)
+            } or amounts
     actual = extract_currency_amounts(answer or "")
+    # Percentage placement fees: require the % fee in the answer; minimum fee
+    # amounts are optional companions, not completeness blockers.
+    if pct_expected and re.search(r"\d{1,3}(?:\.\d+)?\s*%", answer or ""):
+        return bool(pct_expected & actual) or pct_expected.issubset(actual)
+    if re.search(r"(?i)\bpermanent\s+placement\b", question or "") and not re.search(
+        r"\d{1,3}(?:\.\d+)?\s*%", answer or ""
+    ):
+        return False
     return bool(expected) and expected.issubset(actual)

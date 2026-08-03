@@ -128,6 +128,9 @@ class ProcedureContext:
     active_document: Optional[str] = None
     active_section: Optional[str] = None
     active_entity: Optional[str] = None
+    active_program: Optional[str] = None
+    active_benefit: Optional[str] = None
+    active_location: Optional[str] = None
     active_action: Optional[str] = None
     allow_domain_switch: bool = False
     original_question: str = ""
@@ -152,7 +155,7 @@ class ProcedureContext:
             active_domain=domain or self.active_domain,
             active_document=top.document_name or self.active_document,
             active_section=top.section_title or self.active_section,
-            active_entity=top.organization or self.active_entity,
+            active_entity=self.active_entity or top.organization,
             active_action=self.active_action
             or _infer_action(top.section_title or "", top.content or ""),
         )
@@ -164,6 +167,9 @@ class ProcedureContext:
             "active_document": self.active_document,
             "active_section": self.active_section,
             "active_entity": self.active_entity,
+            "active_program": self.active_program,
+            "active_benefit": self.active_benefit,
+            "active_location": self.active_location,
             "active_action": self.active_action,
             "allow_domain_switch": self.allow_domain_switch,
             "locked": self.locked,
@@ -338,7 +344,8 @@ def continuity_score(
     reasons: List[str] = []
 
     if candidate_domain == context.active_domain and context.active_domain != GENERAL:
-        boost += 1.6
+        # Strong continuity only while locked; otherwise domain is a soft ranking cue.
+        boost += 1.6 if context.locked else 0.35
         reasons.append("same_domain")
     elif candidate_domain and candidate_domain != GENERAL:
         if not conflicting_domain_allowed(
@@ -349,13 +356,17 @@ def continuity_score(
         ):
             penalty += 3.2
             reasons.append("cross_domain_reject")
-        else:
+        elif context.locked and not context.allow_domain_switch:
             penalty += 1.55
             reasons.append("domain_mismatch")
+        else:
+            # Unlocked / switchable: never hard-kill cross-domain evidence.
+            penalty += 0.2
+            reasons.append("domain_soft_mismatch")
 
     if context.active_document and document:
         if document.lower() == context.active_document.lower():
-            boost += 1.25
+            boost += 1.25 if context.locked else 0.35
             reasons.append("same_document")
         else:
             # Soft penalty for jumping docs while procedure is locked.
@@ -376,8 +387,38 @@ def continuity_score(
 
     if context.active_entity and organization:
         if context.active_entity.lower() in organization.lower():
-            boost += 0.35
-            reasons.append("same_office")
+            boost += 0.85
+            reasons.append("same_entity")
+        elif context.active_entity.lower() in (content or "").lower():
+            boost += 0.95
+            reasons.append("same_entity_content")
+
+    if context.active_program:
+        program_l = context.active_program.lower()
+        blob_l = f"{section}\n{content}\n{document}".lower()
+        if program_l in blob_l:
+            boost += 0.9
+            reasons.append("same_program")
+
+    if context.active_benefit:
+        benefit_l = context.active_benefit.lower()
+        if benefit_l in f"{section}\n{content}".lower():
+            boost += 0.75
+            reasons.append("same_benefit")
+
+    # Procedural waste/disposal questions should not jump to unrelated fee tables.
+    question_l = (context.original_question or "").lower()
+    if re.search(
+        r"(?i)\b(throw\s+away|dispose|disposal|how\s+do\s+i|steps?|oversized)\b",
+        question_l,
+    ):
+        if candidate_domain == "certificate_fees" or re.search(
+            r"(?i)\b(residence\s+certificate|family\s+register|fee\s+schedule|"
+            r"counter\s+fee|kiosk\s+fee)\b",
+            f"{section}\n{content}\n{document}",
+        ):
+            penalty += 2.8
+            reasons.append("procedural_rejects_unrelated_fees")
 
     reason = "+".join(reasons) if reasons else "neutral"
     return boost, penalty, reason

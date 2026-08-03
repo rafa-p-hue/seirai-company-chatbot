@@ -26,11 +26,21 @@ class VectorStore(ABC):
         company_id: str,
         query_vector: Sequence[float],
         top_k: int,
+        session_id: Optional[str] = None,
+        include_company_docs: bool = True,
+        document_scope: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
     @abstractmethod
-    async def list_documents(self, company_id: str) -> List[DocumentSummary]:
+    async def list_documents(
+        self,
+        company_id: str,
+        *,
+        session_id: Optional[str] = None,
+        document_scope: Optional[str] = "company",
+        include_company_docs: bool = True,
+    ) -> List[DocumentSummary]:
         raise NotImplementedError
 
     @abstractmethod
@@ -44,6 +54,13 @@ class VectorStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def list_payloads(self, company_id: str) -> List[Dict[str, Any]]:
-        """Return all stored chunk payloads for a company (for hybrid lexical search)."""
+    async def list_payloads(
+        self,
+        company_id: str,
+        *,
+        session_id: Optional[str] = None,
+        include_company_docs: bool = True,
+        document_scope: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return stored chunk payloads for a company (optionally session-scoped)."""
         raise NotImplementedError

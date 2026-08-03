@@ -28,10 +28,48 @@ class LocalSentenceTransformerProvider(EmbeddingProvider):
 
     def _load_model(self):
         if self._model is None:
+            import os
+            from pathlib import Path
+
             from sentence_transformers import SentenceTransformer
 
+            # Avoid broken local proxies from the IDE sandbox when loading cached models.
+            for key in (
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ):
+                os.environ.pop(key, None)
+
             logger.info("Loading embedding model: %s", self.model_name)
-            self._model = SentenceTransformer(self.model_name)
+            model_ref = self.model_name
+            cache_snapshots = (
+                Path.home()
+                / ".cache/huggingface/hub"
+                / f"models--{self.model_name.replace('/', '--')}"
+                / "snapshots"
+            )
+            if cache_snapshots.is_dir():
+                snaps = sorted(p for p in cache_snapshots.iterdir() if p.is_dir())
+                if snaps:
+                    model_ref = str(snaps[-1])
+
+            try:
+                self._model = SentenceTransformer(
+                    model_ref,
+                    local_files_only=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Local cache load failed for %s (%s); retrying with download enabled",
+                    self.model_name,
+                    exc,
+                )
+                self._model = SentenceTransformer(self.model_name)
+
             actual_dim = int(self._model.get_sentence_embedding_dimension())
             if actual_dim != self.dimensions:
                 logger.warning(

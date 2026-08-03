@@ -25,10 +25,24 @@ class Settings(BaseSettings):
         alias="CORS_ORIGINS",
     )
     api_prefix: str = Field(default="/api", alias="API_PREFIX")
+    database_url: str = Field(
+        default="sqlite:///./chat_history.db",
+        alias="DATABASE_URL",
+    )
+    chat_history_message_limit: int = Field(
+        default=10,
+        ge=8,
+        le=12,
+        alias="CHAT_HISTORY_MESSAGE_LIMIT",
+    )
     request_timeout_seconds: int = Field(default=60, alias="REQUEST_TIMEOUT_SECONDS")
     max_upload_bytes: int = Field(default=10 * 1024 * 1024, alias="MAX_UPLOAD_BYTES")
 
     default_company_id: str = Field(default="seirai", alias="DEFAULT_COMPANY_ID")
+    not_found_contact_name: str = Field(
+        default="",
+        alias="NOT_FOUND_CONTACT_NAME",
+    )
     allowed_crawl_domains: str = Field(default="", alias="ALLOWED_CRAWL_DOMAINS")
     max_crawl_pages: int = Field(default=20, alias="MAX_CRAWL_PAGES")
 

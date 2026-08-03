@@ -31,6 +31,14 @@ TOPIC_PATTERNS = {
     ),
     "policy": re.compile(r"(?i)\b(policy|procedure|leave|guideline|terms)\b"),
     "product": re.compile(r"(?i)\b(feature|manual|calibrat|install|product|device)\b"),
+    "registration": re.compile(
+        r"(?i)\b(register|registration|moving in|required documents?|resident)\b"
+    ),
+    "fees": re.compile(r"(?i)\b(fee|fees|cost|price|certificate|¥|\$)\b"),
+    "hours": re.compile(r"(?i)\b(office hours?|opening hours?|schedule)\b"),
+    "overview": re.compile(
+        r"(?i)\b(overview|this (?:guide|document|handbook)|purpose|introduction)\b"
+    ),
 }
 
 

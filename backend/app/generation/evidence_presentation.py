@@ -51,6 +51,17 @@ FEE_AMOUNT_KEYS = {
     "cost",
     "amount",
     "fee_amount",
+    "minimum_fee",
+}
+JOB_LISTING_KEYS = {
+    "job_id",
+    "salary_range",
+    "salary",
+    "compensation",
+    "employment_type",
+    "remote_option",
+    "posted_date",
+    "practice",
 }
 FEE_PLACE_KEYS = {
     "where_to_apply",
@@ -304,6 +315,43 @@ def format_fee_fields_as_prose(
     return sentence.strip()
 
 
+def format_job_listing_as_prose(fields: Dict[str, Any]) -> str:
+    """Turn open-position / job CSV rows into natural salary/role prose."""
+    if not fields:
+        return ""
+    normalized = {
+        re.sub(r"[\s-]+", "_", str(k).strip().lower()): str(v).strip()
+        for k, v in fields.items()
+        if str(v).strip()
+    }
+    title = normalized.get("title") or normalized.get("role") or normalized.get("position")
+    location = normalized.get("location") or normalized.get("city") or normalized.get("office")
+    salary = (
+        normalized.get("salary_range")
+        or normalized.get("salary")
+        or normalized.get("compensation")
+        or normalized.get("pay_range")
+    )
+    employment = normalized.get("employment_type") or normalized.get("type")
+    parts: List[str] = []
+    if title and salary and location:
+        parts.append(f"The {title} role in {location} has a salary range of {salary}")
+    elif title and salary:
+        parts.append(f"The {title} role has a salary range of {salary}")
+    elif title and location:
+        parts.append(f"{title} in {location}")
+    elif salary:
+        parts.append(f"Salary range: {salary}")
+    elif title:
+        parts.append(title)
+    if employment and parts:
+        parts[0] = f"{parts[0]} ({employment})"
+    sentence = parts[0] if parts else ""
+    if sentence and not sentence.endswith((".", "!", "?")):
+        sentence += "."
+    return sentence
+
+
 def format_structured_content_as_prose(
     content: str,
     chunk: Optional[RetrievedChunk] = None,
@@ -327,9 +375,26 @@ def format_structured_content_as_prose(
     if not fields:
         return text
 
-    # Fee-shaped records.
     keys_l = {re.sub(r"[\s-]+", "_", k.lower()) for k in fields}
-    if keys_l & FEE_AMOUNT_KEYS or keys_l & FEE_SUBJECT_KEYS:
+
+    # Job / open-position rows — never route through certificate-fee prose.
+    if keys_l & JOB_LISTING_KEYS or (
+        "title" in keys_l
+        and "location" in keys_l
+        and ("salary_range" in keys_l or "salary" in keys_l or "employment_type" in keys_l)
+    ):
+        return format_job_listing_as_prose(fields)
+
+    # Fee-shaped records require an actual fee/amount field — a bare "title"
+    # key (common in job CSVs) must not enter the fee formatter.
+    if keys_l & FEE_AMOUNT_KEYS or (
+        keys_l & FEE_SUBJECT_KEYS
+        and any(
+            re.search(r"(?i)\b(fee|price|cost|¥|yen|sgd|usd|gbp|aud)\b", str(v))
+            for v in fields.values()
+        )
+        and "salary_range" not in keys_l
+    ):
         return format_fee_fields_as_prose(
             fields,
             effective_date=getattr(chunk, "effective_date", None) if chunk else None,
@@ -426,6 +491,19 @@ def repair_passage_text(
     return re.sub(r"[ \t]+\n", "\n", body).strip()
 
 
+def _is_atomic_structured_row(chunk: RetrievedChunk) -> bool:
+    """CSV/table rows must stay isolated — never fuse distinct jobs/fee lines."""
+    ctype = (chunk.content_type or "").lower()
+    if ctype in {"table", "structured_table_row"}:
+        return True
+    if chunk.row_number is not None:
+        return True
+    ftype = (getattr(chunk, "file_type", None) or "").lower()
+    if ftype == "csv":
+        return True
+    return False
+
+
 def expand_sentence_boundaries(
     evidence: Sequence[RetrievedChunk],
 ) -> List[RetrievedChunk]:
@@ -436,6 +514,10 @@ def expand_sentence_boundaries(
     def _starts_mid(text: str) -> bool:
         body = (text or "").strip()
         if not body:
+            return False
+        # Labeled fields / CSV keys ("job_id:", "salary_range:") are complete
+        # records, not unfinished sentence continuations.
+        if re.match(r"^[A-Za-z][A-Za-z0-9_ /-]{0,48}:\s*\S", body):
             return False
         # Only lowercase openings are unfinished sentences from a prior chunk.
         return body[0].islower()
@@ -470,11 +552,21 @@ def expand_sentence_boundaries(
             primary = ordered[i]
             fused = (primary.content or "").strip()
             j = i
+            # Atomic table/CSV rows are never fused with siblings.
+            if _is_atomic_structured_row(primary):
+                fused = repair_passage_text(
+                    fused, section_title=primary.section_title
+                )
+                expanded.append(primary.model_copy(update={"content": fused}))
+                i = j + 1
+                continue
             # Pull following siblings while either side is mid-sentence.
             while j + 1 < len(ordered):
                 nxt = ordered[j + 1]
                 nxt_text = (nxt.content or "").strip()
                 if not nxt_text:
+                    break
+                if _is_atomic_structured_row(nxt):
                     break
                 list_continuation = bool(
                     re.match(r"^\s*[-•●▪◦·]", nxt_text)
@@ -483,6 +575,26 @@ def expand_sentence_boundaries(
                         fused.splitlines()[-1] if fused else "",
                     )
                 )
+                # PPTX/PDF slide/page list bullets on different pages are separate
+                # sections — do not glue Alert Levels into Shelters just because
+                # both start with "•". Require same page/slide or same section.
+                same_section = bool(
+                    (primary.section_title or "").strip()
+                    and (primary.section_title or "").strip().lower()
+                    == (nxt.section_title or "").strip().lower()
+                )
+                same_page = (
+                    primary.page_number is not None
+                    and nxt.page_number is not None
+                    and primary.page_number == nxt.page_number
+                )
+                same_slide = (
+                    getattr(primary, "slide_number", None) is not None
+                    and getattr(nxt, "slide_number", None) is not None
+                    and primary.slide_number == nxt.slide_number
+                )
+                if list_continuation and not (same_section or same_page or same_slide):
+                    list_continuation = False
                 if not (
                     _ends_mid(fused) or _starts_mid(nxt_text) or list_continuation
                 ):
@@ -522,8 +634,8 @@ def merge_procedure_evidence(
         if len(chunks) == 1:
             merged.append(chunks[0])
             continue
-        if not key[1]:
-            # No shared section — still expand sentence boundaries later.
+        if not key[1] or any(_is_atomic_structured_row(c) for c in chunks):
+            # No shared section, or distinct CSV/table rows — keep separate.
             merged.extend(chunks)
             continue
         seen_text = set()
@@ -649,9 +761,11 @@ def extract_currency_amounts(text: str) -> set[str]:
     amounts: set[str] = set()
     for match in re.finditer(
         r"(?i)(?:[$¥€£]\s*(\d[\d,]*(?:\.\d+)?)|"
-        r"(?:fee(?:[_\s-]?(?:jpy|usd|eur|gbp|amount|yen))?|price|cost|amount)"
-        r"\s*[:=]\s*(\d[\d,]*(?:\.\d+)?)|"
-        r"(\d[\d,]*(?:\.\d+)?)\s*(?:USD|JPY|EUR|GBP|dollars?|yen|euros?|pounds?))",
+        r"(?:fee(?:[_\s-]?(?:jpy|usd|eur|gbp|amount|yen))?|price|cost|amount|salary_range|salary)"
+        r"\s*[:=]\s*[^\d]*(\d[\d,]*(?:\.\d+)?)|"
+        r"(?:USD|JPY|EUR|GBP|SGD|AUD)\s*(\d[\d,]*(?:\.\d+)?)|"
+        r"(\d[\d,]*(?:\.\d+)?)\s*(?:USD|JPY|EUR|GBP|SGD|AUD|dollars?|yen|euros?|pounds?)|"
+        r"(\d{1,3}(?:\.\d+)?)\s*%)",
         text or "",
     ):
         number = next((g for g in match.groups() if g), None)

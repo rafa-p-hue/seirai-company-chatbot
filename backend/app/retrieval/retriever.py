@@ -126,10 +126,23 @@ class Retriever:
             document_name=doc_name,
             document_headings=headings,
             service_domain=service_domain
-            or (procedure_context.active_domain if procedure_context else None),
+            or (
+                procedure_context.active_domain
+                if procedure_context
+                and procedure_context.locked
+                and not procedure_context.allow_domain_switch
+                else None
+            ),
             domain_source_question=domain_source_question,
         )
-        if procedure_context and procedure_context.active_domain != "general":
+        # Only lock the query domain for elliptical continuity. Fully specified
+        # questions keep their own domain so prior topics cannot override ranking.
+        if (
+            procedure_context
+            and procedure_context.locked
+            and not procedure_context.allow_domain_switch
+            and procedure_context.active_domain != "general"
+        ):
             understanding.service_domain = procedure_context.active_domain
         # Final evidence size: 3–6. Candidate pool 15–20 before rerank.
         final_k = top_k or min(6, max(5, self.settings.retrieval_top_k))
@@ -153,6 +166,14 @@ class Retriever:
         if understanding.query_type in {"greeting", "unsupported", "help"}:
             return [], understanding, empty_inspection
 
+        logger.info(
+            "RETRIEVAL_START q=%r domain=%s session=%s candidate_k=%s final_k=%s",
+            understanding.original_question,
+            understanding.service_domain,
+            session_id,
+            candidate_k,
+            final_k,
+        )
         retrieval_query = " ".join(
             [understanding.expanded_question, *understanding.expanded_terms]
         ).strip()
@@ -192,11 +213,27 @@ class Retriever:
             session_id=session_id,
             include_company_docs=include_company_docs,
         )
-        active_section = _infer_active_section(
-            understanding.context_question, payloads
-        )
-        if procedure_context and procedure_context.active_section:
-            active_section = procedure_context.active_section
+        # Explicit source-intent asks (fee / salary guide / office / job seeker)
+        # must not inherit the prior turn's section — e.g. fee → job-seeker must
+        # not lock onto "Replacement Guarantee". Procedural follow-ups still do.
+        from app.retrieval.answer_grounding import detect_source_intent
+
+        source_intent = detect_source_intent(understanding.original_question)
+        topic_switch_intents = {
+            "employer_fee",
+            "candidate_fee",
+            "salary_guide",
+            "office_location",
+            "open_position",
+        }
+        if source_intent in topic_switch_intents:
+            active_section = None
+        else:
+            active_section = _infer_active_section(
+                understanding.context_question, payloads
+            )
+            if procedure_context and procedure_context.active_section:
+                active_section = procedure_context.active_section
         extracted_table_rows = [
             dict(payload.get("table_data") or {})
             for payload in payloads
@@ -371,6 +408,16 @@ class Retriever:
             doc_title_boost = title_match_boost(
                 label_question, str(payload.get("document_name") or "")
             )
+            # Exact-entity rescue: distinctive query phrases keep evidence eligible
+            # even when domain confidence is weak/conflicting.
+            entity_rescue = _exact_entity_rescue_boost(
+                question=understanding.original_question,
+                content=content,
+                section_title=str(payload.get("section_title") or ""),
+                document_name=str(payload.get("document_name") or ""),
+            )
+            if entity_rescue >= 1.5 and domain_boost < 0:
+                domain_boost = max(domain_boost, -0.25)
             continuity_boost = 0.0
             cross_domain_penalty = 0.0
             continuity_reason = "n/a"
@@ -541,6 +588,7 @@ class Retriever:
                 + version_boost
                 + domain_boost
                 + doc_title_boost
+                + entity_rescue
                 + continuity_boost
                 - cross_domain_penalty
                 + type_boost
@@ -550,6 +598,8 @@ class Retriever:
                 + type_compat
                 + dup_penalty
             )
+            if entity_rescue >= 1.5:
+                quality_reason = "exact_entity_rescue"
             if domain_boost >= 1.0:
                 quality_reason = "service_domain_match"
             elif domain_boost <= -1.0:
@@ -583,6 +633,7 @@ class Retriever:
                     "version_boost": version_boost,
                     "domain_boost": domain_boost,
                     "title_boost": doc_title_boost,
+                    "entity_rescue": entity_rescue,
                     "continuity_boost": continuity_boost,
                     "cross_domain_penalty": -cross_domain_penalty,
                     "continuity_reason": continuity_reason,
@@ -809,6 +860,20 @@ class Retriever:
             _to_retrieved(item, company_id=company_id, preferred=preferred, development=True)
             for item in initial
         ]
+        logger.info(
+            "RERANK_COMPLETE q=%r top=%s",
+            understanding.original_question,
+            [
+                {
+                    "document_name": (item.get("payload") or {}).get("document_name"),
+                    "section_title": (item.get("payload") or {}).get("section_title"),
+                    "combined": round(float(item.get("combined") or 0.0), 4),
+                    "rerank": round(float(item.get("rerank", item.get("combined") or 0.0)), 4),
+                    "domain_boost": round(float(item.get("domain_boost") or 0.0), 4),
+                }
+                for item in initial[:5]
+            ],
+        )
 
         initial_chunks = [
             _to_retrieved(item, company_id=company_id, preferred=preferred, development=True)
@@ -1110,6 +1175,7 @@ class Retriever:
             "quantity",
             "date",
             "accessibility",
+            "procedure",
         }:
             # Prefer heading-matched and numeric-compatible section content.
             ranked = sorted(
@@ -1118,6 +1184,29 @@ class Retriever:
                     float(item.get("domain_boost") or 0.0)
                     + float(item.get("heading_boost") or 0.0)
                     + float(item.get("numeric_boost") or 0.0)
+                    + (
+                        1.25
+                        if understanding.query_type == "procedure"
+                        and str(item["payload"].get("content_type") or "")
+                        in {"list", "numbered_list"}
+                        else 0.0
+                    )
+                    + (
+                        -2.0
+                        if understanding.query_type == "procedure"
+                        and re.search(
+                            r"(?i)\b(residence\s+certificate|family\s+register|"
+                            r"fee\s+schedule|counter\s+fee|kiosk\s+fee)\b",
+                            f"{item['payload'].get('document_name') or ''} "
+                            f"{item['payload'].get('section_title') or ''} "
+                            f"{item['payload'].get('content') or ''}",
+                        )
+                        and not re.search(
+                            r"(?i)\b(sticker|oversized|dispose|garbage|waste)\b",
+                            str(item["payload"].get("content") or ""),
+                        )
+                        else 0.0
+                    )
                     + float(item.get("rerank", item.get("combined", 0.0)))
                 ),
                 reverse=True,
@@ -1373,6 +1462,51 @@ def _to_retrieved(
     )
 
 
+def _exact_entity_rescue_boost(
+    *,
+    question: str,
+    content: str,
+    section_title: str = "",
+    document_name: str = "",
+) -> float:
+    """Keep strong exact lexical matches eligible despite uncertain domain classification."""
+    from app.retrieval.entity_validation import (
+        entity_match_score,
+        extract_requested_service_phrases,
+    )
+
+    phrases = extract_requested_service_phrases(question)
+    # Also rescue distinctive multi-word program/item names from the question.
+    for match in re.finditer(
+        r"(?i)\b("
+        r"national\s+health\s+insurance|child\s+allowance|residence\s+certificate|"
+        r"family\s+register|burnable\s+garbage|oversized\s+garbage|"
+        r"evacuation\s+shelter|move-?in\s+registration|patient\s+share|"
+        r"co-?payment|insured\s+treatment"
+        r")\b",
+        question or "",
+    ):
+        phrase = re.sub(r"\s+", " ", match.group(1)).strip()
+        if phrase and phrase.lower() not in {p.lower() for p in phrases}:
+            phrases.append(phrase)
+    # Parenthetical local-language aliases.
+    for alias in re.findall(r"\(([^()]{2,80})\)", question or ""):
+        cleaned = re.sub(r"\s+", " ", alias).strip()
+        if cleaned:
+            phrases.append(cleaned)
+    if not phrases:
+        return 0.0
+    blob = "\n".join(part for part in (content, section_title, document_name) if part)
+    score = entity_match_score(blob, phrases)
+    if score >= 1.0:
+        return 2.1
+    if score >= 0.85:
+        return 1.6
+    if score >= 0.75:
+        return 1.0
+    return 0.0
+
+
 def _prefer_matching_domain(
     items: List[Dict[str, Any]],
     service_domain: Optional[str],
@@ -1404,7 +1538,11 @@ def _finalize_domain_evidence(
     service_domain: Optional[str],
     limit: int,
 ) -> List[Dict[str, Any]]:
-    """Prefer same-domain evidence for generation when the query domain is known."""
+    """Prefer same-domain evidence for generation when the query domain is known.
+
+    Domain preference is ranking-only: if no same-domain evidence exists, keep the
+    strongest candidates (including exact-entity rescues) instead of returning empty.
+    """
     from app.ingestion.service_domain import GENERAL
 
     domain = (service_domain or "").strip()
@@ -1413,6 +1551,8 @@ def _finalize_domain_evidence(
 
     def _matches(item: Dict[str, Any]) -> bool:
         if float(item.get("domain_boost") or 0.0) >= 1.0:
+            return True
+        if float(item.get("entity_rescue") or 0.0) >= 1.5:
             return True
         payload = item.get("payload") or {}
         return str(payload.get("service_domain") or "") == domain
@@ -1433,6 +1573,7 @@ def _finalize_domain_evidence(
             if len(merged) >= limit:
                 break
         return merged
+    # Never drop all evidence solely because domain confidence was low.
     return final_items[:limit]
 
 

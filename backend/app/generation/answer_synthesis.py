@@ -18,6 +18,8 @@ from app.generation.evidence_presentation import (
     prepare_evidence_for_generation,
 )
 from app.generation.evidence_validation import (
+    _age_bracket_match_score,
+    _extract_requested_age,
     extract_required_items,
     relevant_price_evidence,
 )
@@ -222,6 +224,9 @@ def synthesize_checklist_answer(
         if piece and piece[0].islower():
             piece = piece[0].upper() + piece[1:]
         lines.append(f"- {piece} [{entry['evidence_index']}]")
+    office_line = _checklist_office_line(evidence)
+    if office_line:
+        lines.append(office_line)
     answer = "\n".join(lines)
     if answer_exposes_internal_field_keys(answer) or looks_like_answer_fragment(answer):
         return FALLBACK_ANSWER
@@ -229,6 +234,40 @@ def synthesize_checklist_answer(
     from app.generation.evidence_validation import strip_checklist_deadline_padding
 
     return strip_checklist_deadline_padding(answer)
+
+
+def _checklist_office_line(evidence: Sequence[RetrievedChunk]) -> Optional[str]:
+    """Preserve submit/office location from the same procedure section."""
+    office_re = re.compile(
+        r"(?i)\b("
+        r"submit(?:\s+the\s+[\w-]+)?\s+(?:notification|application|form)?\s*"
+        r"at\s+(?:the\s+)?[^.\n]{5,80}|"
+        r"at\s+(?:the\s+)?(?:citizen|resident|insurance|welfare|city)\s+"
+        r"(?:services?\s+)?(?:window|desk|counter|office)[^.\n]{0,40}"
+        r")\b"
+    )
+    for index, chunk in enumerate(evidence, start=1):
+        blob = "\n".join(
+            part
+            for part in (
+                chunk.content or "",
+                chunk.section_title or "",
+                getattr(chunk, "responsible_office", None) or "",
+            )
+            if part
+        )
+        match = office_re.search(blob)
+        if not match:
+            continue
+        phrase = re.sub(r"\s+", " ", match.group(0)).strip(" .,")
+        if not phrase:
+            continue
+        if not phrase[0].isupper():
+            phrase = phrase[0].upper() + phrase[1:]
+        if not phrase.endswith((".", "!", "?")):
+            phrase += "."
+        return f"{phrase} [{index}]"
+    return None
 
 
 def format_checklist_item_phrase(entry: Dict[str, Any]) -> str:
@@ -304,6 +343,8 @@ def synthesize_fee_answer(
     selected = relevant_price_evidence(question, evidence)
     if not selected:
         return FALLBACK_ANSWER
+    requested_age = _extract_requested_age(question)
+    service_label = _fee_service_label(question, evidence)
     lines: List[str] = []
     seen = set()
     for evidence_index, chunk in selected:
@@ -317,6 +358,21 @@ def synthesize_fee_answer(
             if not looks_like_structured_record(raw, chunk):
                 # Plain currency sentence already in evidence.
                 prose = re.sub(r"\s+", " ", raw).strip()
+        # Age-specific benefit: keep only the matching bracket sentence.
+        if requested_age is not None and prose:
+            sentences = [
+                part.strip()
+                for part in re.split(r"(?<=[.!?])\s+|\n+", prose)
+                if part.strip()
+            ]
+            age_hits = [
+                sent
+                for sent in sentences
+                if _age_bracket_match_score(sent, requested_age) >= 0.8
+                and re.search(r"(?i)\b(?:¥|yen|\d[\d,]*)\b", sent)
+            ]
+            if age_hits:
+                prose = age_hits[0]
         prose = re.sub(r"\s+", " ", prose).strip()
         if not prose or answer_exposes_internal_field_keys(prose):
             continue
@@ -331,9 +387,134 @@ def synthesize_fee_answer(
         lines.append(f"{prose} [{evidence_index}]")
     if not lines:
         return FALLBACK_ANSWER
+    combined = _compose_named_fee_answer(
+        service_label,
+        lines,
+        minimum_fee=_minimum_fee_from_evidence(evidence),
+    )
+    if combined:
+        return combined
     if len(lines) == 1:
         return lines[0]
     return "\n".join(f"- {line}" for line in lines)
+
+
+def _minimum_fee_from_evidence(evidence: Sequence[RetrievedChunk]) -> str:
+    for chunk in evidence:
+        match = re.search(
+            r"(?i)(minimum\s+fee\s*:\s*(?:SGD|USD|EUR|GBP|AUD)?\s*[\d,]+)",
+            chunk.content or "",
+        )
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _fee_service_label(
+    question: str, evidence: Sequence[RetrievedChunk]
+) -> str:
+    """Best service/product name for a fee answer (from evidence, else question)."""
+    from app.retrieval.entity_validation import (
+        extract_requested_service_phrases,
+        service_phrases_for_matching,
+    )
+
+    phrases = service_phrases_for_matching(extract_requested_service_phrases(question))
+    for chunk in evidence:
+        text = chunk.content or ""
+        match = re.search(r"(?i)\bservice\s*:\s*([^.\n]+)", text)
+        if match:
+            label = re.sub(r"\s+", " ", match.group(1)).strip(" .;")
+            label = re.sub(r"\s*\([^)]*\)\s*$", "", label).strip()
+            if not label:
+                continue
+            if not phrases or any(
+                p.lower() in label.lower() or label.lower() in p.lower() for p in phrases
+            ):
+                return label
+    for phrase in phrases:
+        if len(phrase) >= 4:
+            return phrase
+    return ""
+
+
+def _compose_named_fee_answer(
+    service_label: str,
+    lines: Sequence[str],
+    *,
+    minimum_fee: str = "",
+) -> str:
+    """Build one grounded sentence that names the service (entity-gate safe)."""
+    if not lines:
+        return ""
+    blob = " ".join(lines)
+    # Strip citation markers while collecting first cite.
+    cites = re.findall(r"\[(\d+)\]", blob)
+    cite = f" [{cites[0]}]" if cites else ""
+    plain = re.sub(r"\s*\[\d+\]", "", blob)
+    plain = re.sub(r"\s+", " ", plain).strip(" -")
+    if minimum_fee and minimum_fee.lower() not in plain.lower():
+        plain = f"{plain} {minimum_fee}".strip()
+    if not plain:
+        return ""
+    if service_label and service_label.lower() not in plain.lower():
+        # Prefer "The permanent placement fee is 22% … Minimum fee: SGD 9,000."
+        # Prefer an explicit percentage-of-salary fee when present.
+        pct_match = re.search(
+            r"(?i)\d{1,3}(?:\.\d+)?\s*%\s+of\s+(?:the\s+)?"
+            r"(?:candidate'?s\s+)?(?:first[- ]year\s+)?(?:base\s+salary|total\s+compensation)"
+            r"[^.\[\]]*",
+            plain,
+        )
+        if not pct_match:
+            pct_match = re.search(r"(?i)\d{1,3}(?:\.\d+)?\s*%\s+of\s+first[- ]year[^.\[\]]*", plain)
+        min_match = re.search(
+            r"(?i)(minimum\s+fee\s*:\s*(?:SGD|USD|EUR|GBP|AUD)?\s*[\d,]+|"
+            r"minimum(?:\s+fee)?\s+(?:of\s+)?(?:SGD|USD|EUR|GBP|AUD)?\s*[\d,]+)",
+            plain,
+        )
+        if pct_match:
+            amount = pct_match.group(0).strip(" .;")
+            sentence = f"The {service_label} fee is {amount}"
+            if min_match and min_match.group(1).lower() not in sentence.lower():
+                sentence = f"{sentence}. {min_match.group(1).rstrip('.')}"
+            if not sentence.endswith((".", "!", "?")):
+                sentence += "."
+            return f"{sentence}{cite}"
+        # Minimum-fee money alone is not the placement fee (need an explicit %).
+        if re.search(r"(?i)\bpermanent\s+placement|placement\s+fee\b", service_label or ""):
+            if not re.search(r"\d{1,3}(?:\.\d+)?\s*%", plain):
+                return ""
+        fee_match = re.search(
+            r"(?i)(?:fee[^.:]*:\s*)?((?:SGD|USD|EUR|GBP|AUD)\s*[\d,]+|¥[\d,]+|\$[\d,]+)",
+            plain,
+        )
+        # Never promote a "Minimum fee: SGD …" row as the primary fee amount.
+        if fee_match and re.search(r"(?i)minimum\s+fee", plain):
+            if not re.search(r"\d{1,3}(?:\.\d+)?\s*%", plain):
+                return ""
+        if fee_match:
+            amount = fee_match.group(1).strip(" .;")
+            sentence = f"The {service_label} fee is {amount}"
+            if min_match and min_match.group(1).lower() not in sentence.lower():
+                sentence = f"{sentence}. {min_match.group(1).rstrip('.')}"
+            if not sentence.endswith((".", "!", "?")):
+                sentence += "."
+            return f"{sentence}{cite}"
+        # Fallback: prefix the service name onto the first fact.
+        first = re.sub(r"\s*\[\d+\]", "", lines[0]).strip()
+        if minimum_fee and minimum_fee.lower() not in first.lower():
+            first = f"{first.rstrip('.')} {minimum_fee}."
+        return f"For {service_label}: {first}{cite}"
+    if len(lines) == 1:
+        answer = lines[0]
+        if minimum_fee and minimum_fee.lower() not in answer.lower():
+            answer = re.sub(r"\s*\[\d+\]\s*$", "", answer).rstrip(".")
+            cite_m = re.search(r"\[(\d+)\]", lines[0])
+            cite_s = f" [{cite_m.group(1)}]" if cite_m else ""
+            return f"{answer}. {minimum_fee}.{cite_s}"
+        return answer
+    return ""
 
 
 def checklist_structure_is_covered(

@@ -1,26 +1,93 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #f1f5f9;
+  --foreground: #0f172a;
+  --chat-border: #e2e8f0;
+  --chat-sidebar-width: 260px;
+  --chat-sidebar-collapsed-width: 68px;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: Arial, Helvetica, sans-serif;
+  --font-sans: "Segoe UI", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans);
+}
+
+html {
+  color-scheme: light;
+}
+
+.chat-column {
+  width: 100%;
+  max-width: 840px;
+  margin-inline: auto;
+}
+
+/* Desktop chat shell: sidebar is a real left column, never an overlay. */
+.chat-shell {
+  display: flex;
+  width: 100%;
+  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--background);
+}
+
+.chat-sidebar {
+  width: var(--chat-sidebar-width);
+  min-width: var(--chat-sidebar-width);
+  flex: 0 0 var(--chat-sidebar-width);
+  display: flex !important;
+  flex-direction: column;
+  border-right: 1px solid #cbd5e1;
+  background: #f8fafc;
+  min-height: 100%;
+  transition: width 0.2s ease, min-width 0.2s ease, flex-basis 0.2s ease;
+  z-index: 2;
+  box-shadow: inset 3px 0 0 #0ea5e9;
+}
+
+.chat-sidebar[data-collapsed="true"] {
+  width: var(--chat-sidebar-collapsed-width);
+  min-width: var(--chat-sidebar-collapsed-width);
+  flex-basis: var(--chat-sidebar-collapsed-width);
+}
+
+.chat-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.chat-sidebar-mobile-host {
+  display: none;
+}
+
+/* Always keep the left sidebar column visible.
+   On small screens it stays as a flex sibling (use collapsed icon rail),
+   never display:none. The slide-over drawer is an extra mobile affordance. */
+@media (max-width: 767px) {
+  .chat-sidebar-mobile-host {
+    display: block;
+  }
+
+  .chat-shell .chat-main .chat-mobile-menu {
+    display: inline-flex;
+  }
+}
+
+.chat-mobile-menu {
+  display: none;
 }

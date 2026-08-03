@@ -49,6 +49,8 @@ LABEL_FAMILIES: Dict[str, Tuple[str, ...]] = {
 }
 
 # Query intent → preferred label families (ordered by priority).
+# quantity/price/date intentionally omit broad policy/product families so
+# generic "Policy:" / "Model:" labels do not outrank the numeric evidence.
 INTENT_LABEL_FAMILIES: Dict[str, Tuple[str, ...]] = {
     "education": ("major", "minor", "organization", "name"),
     "school": ("organization",),
@@ -61,7 +63,10 @@ INTENT_LABEL_FAMILIES: Dict[str, Tuple[str, ...]] = {
     "policy": ("policy", "date"),
     "product": ("product", "date"),
     "location": ("organization", "name"),
-    "general": ("name", "email", "major", "policy", "product"),
+    "quantity": (),
+    "price": (),
+    "date": ("date",),
+    "general": ("name", "email", "major"),
 }
 
 # Query text cues → label families (for synonym matching beyond intent).
@@ -106,8 +111,21 @@ def label_family(label: str) -> Optional[str]:
 def families_for_query(question: str, query_type: str) -> List[str]:
     ordered: List[str] = []
     seen: Set[str] = set()
+    # For numeric/temporal fact questions, only keep families the question
+    # actually cues — avoid boosting unrelated Policy:/Model: labels.
+    numeric_types = {"quantity", "price", "date"}
     for pattern, family in QUERY_FAMILY_CUES:
         if pattern.search(question or ""):
+            if query_type in numeric_types and family in {"policy", "product"}:
+                # Only allow when the question literally asks about that family.
+                if family == "policy" and not re.search(
+                    r"(?i)\b(policy|procedure|guideline)\b", question or ""
+                ):
+                    continue
+                if family == "product" and not re.search(
+                    r"(?i)\b(product|model|sku|specification)\b", question or ""
+                ):
+                    continue
             if family not in seen:
                 ordered.append(family)
                 seen.add(family)

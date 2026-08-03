@@ -85,10 +85,41 @@ INSTRUMENT_RE = re.compile(
 )
 SUMMARY_RE = re.compile(
     r"\b("
-    r"what can you tell me about|tell me about|about this document|"
-    r"about the (main )?subject|overview|summary|who is|who'?s"
+    r"what can you tell me about|tell me about|"
+    r"what is this (?:document|file|guide|handbook|pdf) about|"
+    r"what does this (?:document|file|guide|handbook|pdf) cover|"
+    r"summarize (?:this|the) (?:document|file|guide|handbook|pdf)|"
+    r"give me (?:an |a )?(?:overview|summary)|"
+    r"document overview|about this document|about the (main )?subject|"
+    r"overview|summary|who is|who'?s"
     r")\b",
     re.I,
+)
+DOCUMENT_SUMMARY_RE = re.compile(
+    r"(?i)\b("
+    r"what is this (?:document|file|guide|handbook|pdf) about|"
+    r"what does this (?:document|file|guide|handbook|pdf) cover|"
+    r"summarize (?:this|the) (?:document|file|guide|handbook|pdf)|"
+    r"give me (?:an |a )?(?:overview|summary)(?: of (?:this|the) "
+    r"(?:document|file|guide|handbook|pdf))?|"
+    r"about this document|document overview|"
+    r"what can you tell me about this document|"
+    r"tell me about this document"
+    r")\b"
+)
+PROCEDURAL_ACTION_RE = re.compile(
+    r"(?i)\b("
+    r"register(?:ation)?|apply|application|enroll(?:ment)?|submit|"
+    r"moving\s+in|move-?in(?:\s+notification)?|moved(?:\s+in)?|"
+    r"residence|resident|renew(?:al)?|"
+    r"cancel(?:lation)?|request|file"
+    r")\b"
+)
+MOVE_TOPIC_RE = re.compile(
+    r"(?i)\b(moving\s+in|move-?in|moved(?:\s+in)?|move-in\s+notification)\b"
+)
+REGISTER_TOPIC_RE = re.compile(
+    r"(?i)\b(register(?:ation)?|move-in\s+notification|notification)\b"
 )
 STUDY_RE = re.compile(
     r"\b(stud(?:y|ies|ying)|major|degree|field of study|academic program|education)\b",
@@ -110,6 +141,8 @@ class QueryUnderstanding:
     query_type: str
     expanded_terms: List[str] = field(default_factory=list)
     subject_name: Optional[str] = None
+    context_question: Optional[str] = None
+    service_domain: Optional[str] = None
 
 
 # Soft ranking preferences only — never hard filters. Always include universal.
@@ -129,12 +162,14 @@ PREFERRED_TYPES = {
     "interest": ["universal", "skills", "leadership", "experience"],
     "skills": ["universal", "skills", "experience"],
     "policy": ["universal", "section"],
+    "checklist": ["universal", "section"],
+    "procedure": ["universal", "section"],
     "product": ["universal", "section"],
     "location": ["universal", "profile"],
     "awards": ["universal", "profile", "experience", "leadership"],
     "executive": ["universal", "experience", "profile"],
     "instrument": ["universal", "skills", "leadership", "experience"],
-    "price": ["universal", "section"],
+    "price": ["universal", "section", "table_row"],
     "quantity": ["universal", "section"],
     "date": ["universal", "section", "education"],
     "accessibility": ["universal", "section"],
@@ -150,7 +185,11 @@ def understand_query(
     document_entities: Sequence[str] | None = None,
     document_name: Optional[str] = None,
     document_headings: Sequence[str] | None = None,
+    service_domain: Optional[str] = None,
+    domain_source_question: Optional[str] = None,
 ) -> QueryUnderstanding:
+    from app.ingestion.service_domain import extract_query_service_domain
+
     normalized = _normalize(question)
     history_text = " ".join(
         msg.content for msg in (history or []) if msg.role in {"user", "assistant"}
@@ -174,6 +213,33 @@ def understand_query(
         resolved,
         subject_name=subject if subject_name or document_entities else None,
     )
+    context_question = _previous_user_question(history, normalized)
+    # Cross-turn elliptical follow-ups: resolve from prior user Q + assistant A.
+    from app.retrieval.conversation_context import (
+        anchors_from_history,
+        is_elliptical_followup_question,
+        resolve_followup_question,
+    )
+
+    conversation_anchors = anchors_from_history(history, current_question=normalized)
+    if is_elliptical_followup_question(normalized):
+        resolved = resolve_followup_question(
+            normalized, history=history, anchors=conversation_anchors
+        )
+        query_type = classify_query(
+            resolved,
+            subject_name=subject if subject_name or document_entities else None,
+        )
+    if query_type == "checklist" and context_question and _is_elliptical_checklist(
+        normalized
+    ):
+        topic = extract_procedural_topic(context_question) or context_question
+        resolved = resolve_checklist_follow_up(normalized, topic)
+    elif query_type == "date" and context_question and _is_elliptical_deadline(
+        normalized
+    ):
+        topic = extract_procedural_topic(context_question) or context_question
+        resolved = resolve_deadline_follow_up(normalized, topic)
     expanded_terms = expand_terms(resolved, query_type=query_type)
     if document_headings:
         expanded_terms = sorted(
@@ -191,6 +257,9 @@ def understand_query(
         subject_name=subject,
         history=history,
     )
+    # Domain comes from the full original user question (before split), when provided.
+    domain_blob = domain_source_question or context_question or question
+    resolved_domain = service_domain or extract_query_service_domain(domain_blob)
     return QueryUnderstanding(
         original_question=question,
         normalized_question=normalized,
@@ -201,6 +270,186 @@ def understand_query(
         subject_name=None
         if subject == "the main subject described in the document"
         else subject,
+        context_question=context_question,
+        service_domain=resolved_domain,
+    )
+
+
+def _previous_user_question(
+    history: Sequence[ChatMessage] | None, current_question: str
+) -> Optional[str]:
+    current = _normalize(current_question).rstrip(" ?").lower()
+    for message in reversed(list(history or [])):
+        if message.role != "user":
+            continue
+        candidate = _normalize(message.content).strip()
+        if not candidate or candidate.rstrip(" ?").lower() == current:
+            continue
+        return candidate
+    return None
+
+
+def _is_elliptical_checklist(question: str) -> bool:
+    text = _normalize(question).lower().strip()
+    return bool(
+        re.fullmatch(
+            r"(?:and\s+)?(?:what|which)\s+(?:do|should|must)?\s*"
+            r"(?:i|we)?\s*(?:need to\s+)?(?:bring|submit|provide|required)"
+            r"(?:\s+(?:with me|with us))?\??",
+            text,
+        )
+        or (
+            re.search(
+                r"(?i)\b(what|which).*\b(bring|submit|provide|required)\b",
+                text,
+            )
+            and len(re.findall(r"[a-z0-9]+", text)) <= 8
+            and not PROCEDURAL_ACTION_RE.search(text)
+        )
+    )
+
+
+def _is_elliptical_deadline(question: str) -> bool:
+    text = _normalize(question).lower().strip()
+    return bool(
+        re.fullmatch(
+            r"(?:and\s+)?when\s+(?:do|does|must|should)?\s*"
+            r"(?:i|we)?\s*(?:need to\s+)?(?:register|apply|submit|enroll)\??",
+            text,
+        )
+    )
+
+
+def extract_procedural_topic(text: str) -> Optional[str]:
+    """Pull a short, retrieval-ready procedure topic (never a full sentence)."""
+    cleaned = _normalize(text or "")
+    if not cleaned:
+        return None
+    has_move = bool(MOVE_TOPIC_RE.search(cleaned))
+    has_register = bool(REGISTER_TOPIC_RE.search(cleaned))
+    if has_move and has_register:
+        return "moving-in registration"
+    if has_move:
+        return "moving in"
+    if has_register:
+        return "registration"
+    action = PROCEDURAL_ACTION_RE.search(cleaned)
+    if not action:
+        return None
+    token = re.sub(r"\s+", " ", action.group(0)).strip(" .,?!")
+    return token or None
+
+
+def resolve_checklist_follow_up(question: str, topic: str) -> str:
+    topic = (topic or "registration").strip(" .?")
+    # Never search bare elliptical phrasing alone.
+    return f"What documents are required for {topic}?"
+
+
+def resolve_deadline_follow_up(question: str, topic: str) -> str:
+    topic = (topic or "registration").strip(" .?")
+    if re.search(r"(?i)\b(moving|register|registration)\b", topic):
+        return (
+            f"What is the deadline for the {topic} procedure?"
+            if "procedure" not in topic.lower()
+            else f"What is the deadline for the {topic}?"
+        )
+    return f"What is the deadline for {topic}?"
+
+
+def resolve_compound_subquestions(
+    sub_questions: Sequence[str],
+    *,
+    original_question: str = "",
+    active_procedure: Optional[str] = None,
+    active_domain: Optional[str] = None,
+) -> List[str]:
+    """Build retrieval-ready sub-questions that share procedural context."""
+    cleaned = [strip_question_preamble(item) for item in sub_questions]
+    shared_topic = (active_procedure or "").strip() or extract_procedural_topic(
+        original_question or ""
+    )
+    if not shared_topic:
+        for item in cleaned:
+            shared_topic = extract_procedural_topic(item)
+            if shared_topic:
+                break
+    if not shared_topic:
+        shared_topic = extract_procedural_topic(" ".join(cleaned))
+    if not shared_topic and active_domain:
+        from app.retrieval.procedure_context import PROCEDURE_LABELS
+
+        shared_topic = PROCEDURE_LABELS.get(active_domain)
+    # Prefer a stable procedure phrase so elliptical follow-ups stay on-topic.
+    if shared_topic and "procedure" not in shared_topic.lower():
+        if re.search(r"(?i)\b(moving|register|resident|insurance|enroll)\b", shared_topic):
+            procedure_topic = f"{shared_topic} procedure"
+        else:
+            procedure_topic = shared_topic
+    else:
+        procedure_topic = shared_topic or "the current procedure"
+
+    resolved: List[str] = []
+    for item in cleaned:
+        query_type = classify_query(item)
+        local_topic = procedure_topic
+        # Specialize when the sub-clause itself names enroll vs register-address.
+        if re.search(r"(?i)\b(enroll|insurance)\b", item):
+            local_topic = "health-insurance enrollment procedure"
+        elif re.search(r"(?i)\bregister(?:\s+my)?\s+address\b", item):
+            local_topic = "move-in resident-registration procedure"
+        if query_type == "checklist" and (
+            _is_elliptical_checklist(item) or not PROCEDURAL_ACTION_RE.search(item)
+        ):
+            resolved.append(
+                f"What documents are required for the same {local_topic}?"
+            )
+        elif query_type == "date" and (
+            shared_topic
+            or _is_elliptical_deadline(item)
+            or PROCEDURAL_ACTION_RE.search(item)
+        ):
+            if re.search(r"(?i)\benroll\b", item):
+                resolved.append(
+                    "What is the deadline for the health-insurance enrollment procedure?"
+                )
+            elif re.search(r"(?i)\bregister(?:\s+my)?\s+address\b", item):
+                resolved.append(
+                    "What is the deadline for the move-in resident-registration procedure?"
+                )
+            else:
+                resolved.append(resolve_deadline_follow_up(item, local_topic))
+        else:
+            resolved.append(item)
+    return resolved
+
+
+def strip_question_preamble(text: str) -> str:
+    """Drop leading narrative sentences that are not themselves questions."""
+    value = _normalize(text or "")
+    if not value:
+        return value
+    parts = re.split(r"(?<=[.!])\s+", value)
+    if len(parts) <= 1:
+        return value if value.endswith("?") or _looks_like_interrogative(value) else value
+    questions = [part for part in parts if _looks_like_interrogative(part)]
+    if questions:
+        joined = " ".join(questions)
+        if not joined.endswith("?") and _looks_like_interrogative(joined):
+            joined = joined + "?"
+        return joined
+    return value
+
+
+def _looks_like_interrogative(text: str) -> bool:
+    lower = (text or "").lower().strip()
+    if lower.endswith("?"):
+        return True
+    return bool(
+        re.match(
+            r"^(what|who|where|when|why|how|is|are|does|do|did|can|could|which|whose)\b",
+            lower,
+        )
     )
 
 
@@ -220,26 +469,98 @@ def classify_query(question: str, *, subject_name: Optional[str] = None) -> str:
     if re.search(r"\b(password|social security|zodiac)\b", lower):
         return "unsupported"
 
+    # Procedural how-to / disposal / multi-step instructions.
+    if re.search(
+        r"\b("
+        r"how\s+do\s+i\s+(?:throw\s+away|dispose|discard|apply|register|enroll|submit)|"
+        r"how\s+(?:can|should|do)\s+i\s+(?:throw\s+away|dispose|discard)|"
+        r"what\s+steps?\s+(?:do\s+i\s+)?(?:follow|take)|"
+        r"how\s+to\s+(?:throw\s+away|dispose|discard|apply)|"
+        r"disposal\s+(?:steps?|procedure|process)"
+        r")\b",
+        lower,
+    ):
+        return "procedure"
+
+    if re.search(
+        r"\b("
+        r"what (?:do|should|must) (?:i|we) bring|"
+        r"what (?:documents?|items?|materials?) (?:do|should|must) (?:i|we) need|"
+        r"what (?:do|should|must) (?:i|we) need(?:\s+to\s+(?:bring|submit|provide)|\s+for\b)|"
+        r"what is required|what are the requirements|"
+        r"which documents?|documents? (?:are )?(?:needed|required)|"
+        r"required (?:items?|documents?|materials?)|"
+        r"what (?:do|does) .+ need to (?:bring|submit|provide)|"
+        r"need for (?:the\s+)?(?:move-?in|registration|notification)"
+        r")\b",
+        lower,
+    ):
+        return "checklist"
+
+    # Numeric / temporal fact shapes — classify even without "policy" in the question.
+    # "How much water/food…" is quantity, not a fee/price question.
+    if re.search(r"\bhow much\b", lower) and re.search(
+        r"\b(water|food|supply|supplies|stock|stockpile|liters?|litres?|"
+        r"emergency|keep|store|bring)\b",
+        lower,
+    ):
+        return "quantity"
+    # Patient cost-share / co-payment percentage (not a certificate fee).
+    if re.search(
+        r"\b(share|co-?payment|percent(?:age)?|patient\s+share)\b", lower
+    ) and re.search(
+        r"\b(medical|insurance|health\s+insurance|treatment|counter)\b", lower
+    ):
+        return "policy"
+    # Compensation / open-role salary questions are price facts, not resume experience.
+    if re.search(
+        r"\b(salary|salaries|compensation|pay\s+range|salary\s+range|earn|earns)\b",
+        lower,
+    ) and re.search(
+        r"\b(job|role|position|opening|engineer|manager|analyst|guide|"
+        r"singapore|london|sydney|remote|devops|according\s+to)\b",
+        lower,
+    ):
+        return "price"
+    # Candidate / job-seeker cost policy (free of charge), before generic fee→price.
+    if re.search(
+        r"\b("
+        r"job\s+seeker|as\s+a\s+(?:job\s+)?seeker|as\s+a\s+candidate|"
+        r"do\s+i\s+have\s+to\s+pay|have\s+to\s+pay\b.+\banything|"
+        r"pay\b.+\banything\s+as\s+a|free\s+for\s+(?:candidates?|job\s+seekers?)"
+        r")\b",
+        lower,
+    ):
+        return "policy"
+    if re.search(r"\b(price|costs?|fee|fees|how much|dues|\$|pricing|salary|salaries)\b", lower):
+        return "price"
+    if re.search(r"\b(how many|quantity|pounds|tons|amount|number of|capacity)\b", lower):
+        return "quantity"
+    if re.search(r"\bwhat\s+is\s+(?:the\s+)?capacity\b", lower):
+        return "quantity"
+    if re.search(
+        r"\b(when|opening|timeline|what year|what period|date|deadline|due)\b", lower
+    ) and re.search(
+        r"\b(open|opening|plan|future|timeline|announce|register|apply|submit|enroll|"
+        r"due|deadline|enrollment|collect(?:ed|ion)?|paid|payment|pay)\b",
+        lower,
+    ):
+        return "date"
+
     # Policy / handbook fact questions (before generic unsupported-style cues).
     if re.search(
         r"\b(refund|cancellation|cancel|membership|pet|pets|volunteer|"
         r"compost|sustainab|rental|rentals|alcohol|"
         r"accessib(?:le|ility)|disabilit(?:y|ies)|wheelchair|ada|"
-        r"donation|donated|opening (?:date|period)|future plans?)\b",
+        r"donation|donated|opening (?:date|period)|future plans?|"
+        r"leave|pto|paid\s+leave|vacation|time\s+off|remote\s+work|"
+        r"handbook|guidelines?)\b",
         lower,
     ) or re.search(r"\b(policy|policies|rules?|prohibited|allowed)\b", lower):
         if re.search(
             r"\b(accessib(?:le|ility)|disabilit(?:y|ies)|wheelchair|ada)\b", lower
         ):
             return "accessibility"
-        if re.search(r"\b(price|cost|fee|fees|how much|dues|\$)\b", lower):
-            return "price"
-        if re.search(r"\b(how many|quantity|pounds|tons|amount)\b", lower):
-            return "quantity"
-        if re.search(
-            r"\b(when|opening|timeline|what year|what period|date)\b", lower
-        ) and re.search(r"\b(open|opening|plan|future|timeline)\b", lower):
-            return "date"
         return "policy"
 
     if GPA_RE.search(lower):
@@ -277,7 +598,8 @@ def classify_query(question: str, *, subject_name: Optional[str] = None) -> str:
         return "accessibility"
     if re.search(
         r"\b(what state|which state|hometown|where .+ located|school located|"
-        r"based in|live[s]?|city|address|where is)\b",
+        r"based in|live[s]?|city|address|where is|"
+        r"office\s+in|have\s+an?\s+office|offices?\s+in|branch\s+in)\b",
         lower,
     ) and not re.search(r"\b(attend|university|college)\b", lower):
         return "location"
@@ -326,21 +648,30 @@ def classify_query(question: str, *, subject_name: Optional[str] = None) -> str:
         return "education"
 
     # Broad document/person summaries.
-    if lower in {
+    if DOCUMENT_SUMMARY_RE.search(lower) or lower in {
         "what can you tell me about this document",
-        "tell me about the main subject",
         "tell me about this document",
         "about this document",
+        "what is this document about",
+        "what does this file cover",
+        "summarize this document",
+        "give me an overview",
+    }:
+        return "summary"
+    if lower in {
+        "tell me about the main subject",
         "who is the main person",
         "who is the person",
-    } or (
+    } or re.search(r"\b(who is|who'?s)\b", lower):
+        return "identity"
+    if (
         SUMMARY_RE.search(lower)
         and not ROLE_EXPERIENCE_RE.search(lower)
         and not STUDY_RE.search(lower)
         and not MUSIC_RE.search(lower)
         and not HELP_RE.match(lower)
     ):
-        if re.search(r"\b(who is|who'?s)\b", lower) or lower.startswith("tell me about"):
+        if lower.startswith("tell me about"):
             return "identity"
         return "summary"
 
@@ -504,12 +835,28 @@ def expand_short_question(
         "who is the person": f"Who is the main person described in the document and what identifying fields are listed?",
         "tell me about the main subject": f"Provide a brief overview of {subject_name} covering identity, education, roles, research, and affiliations.",
         "what can you tell me about this document": (
-            "Provide a brief overview of the main subject in this document, "
-            "covering identity, education, responsibilities, research, and affiliations."
+            "Provide a short synthesized overview of this document covering its purpose, "
+            "main topics, major policies or procedures, and important dates or fees when present."
         ),
         "tell me about this document": (
-            "Provide a brief overview of the main subject in this document, "
-            "covering identity, education, responsibilities, research, and affiliations."
+            "Provide a short synthesized overview of this document covering its purpose, "
+            "main topics, major policies or procedures, and important dates or fees when present."
+        ),
+        "what is this document about": (
+            "Provide a short synthesized overview of this document covering its purpose, "
+            "main topics, major policies or procedures, and important dates or fees when present."
+        ),
+        "what does this file cover": (
+            "Provide a short synthesized overview of this document covering its purpose, "
+            "main topics, major policies or procedures, and important dates or fees when present."
+        ),
+        "summarize this document": (
+            "Provide a short synthesized overview of this document covering its purpose, "
+            "main topics, major policies or procedures, and important dates or fees when present."
+        ),
+        "give me an overview": (
+            "Provide a short synthesized overview of this document covering its purpose, "
+            "main topics, major policies or procedures, and important dates or fees when present."
         ),
     }
     for pattern, template in list(expansions.items()):
@@ -542,7 +889,17 @@ def expand_short_question(
     if re.search(r"\bfound(?:ed|er)?\b", key):
         return expansions["what group did the person found"]
 
-    if query_type in {"identity", "summary"}:
+    if DOCUMENT_SUMMARY_RE.search(question) or DOCUMENT_SUMMARY_RE.search(key):
+        return (
+            "Provide a short synthesized overview of this document covering its purpose, "
+            "main topics, major policies or procedures, and important dates or fees when present."
+        )
+    if query_type == "identity":
+        return (
+            f"Provide a brief overview of {subject_name} covering identity, education, "
+            f"responsibilities and activities, research or projects, and affiliations."
+        )
+    if query_type == "summary":
         return (
             f"Provide a brief overview of {subject_name} covering identity, education, "
             f"responsibilities and activities, research or projects, and affiliations."
@@ -576,6 +933,8 @@ def expand_short_question(
         return f"What internship or temporary roles are listed for {subject_name}?"
     if query_type == "policy":
         return f"What policy details in the document answer: {question}"
+    if query_type == "checklist":
+        return f"What complete required-item checklist in the document answers: {question}"
     if query_type == "product":
         return f"What product or manual details in the document answer: {question}"
     return question
@@ -714,10 +1073,19 @@ def expand_terms(question: str, *, query_type: str) -> List[str]:
     if query_type in SUMMARY_QUERY_TYPES:
         out.update(
             {
-                "name",
-                "profile",
                 "summary",
                 "overview",
+                "purpose",
+                "introduction",
+                "guide",
+                "handbook",
+                "policy",
+                "procedure",
+                "registration",
+                "fees",
+                "services",
+                "name",
+                "profile",
                 "education",
                 "major",
                 "research",
@@ -733,6 +1101,56 @@ def expand_terms(question: str, *, query_type: str) -> List[str]:
         out.update({"name", "profile", "summary", "overview", "email", "title", "education", "major"})
     if query_type == "policy":
         out.update({"policy", "procedure", "guideline"})
+    if query_type in {"checklist", "date", "policy"}:
+        procedural_cue = any(
+            token in tokens
+            or token in question.lower()
+            for token in (
+                "register",
+                "registration",
+                "moving",
+                "move",
+                "bring",
+                "notification",
+                "deadline",
+                "within",
+                "submit",
+                "required",
+                "documents",
+            )
+        ) or query_type == "checklist"
+        if procedural_cue:
+            out.update(
+                {
+                    "moving",
+                    "move",
+                    "move-in",
+                    "register",
+                    "registration",
+                    "notification",
+                    "within",
+                    "days",
+                    "bring",
+                    "required",
+                    "documents",
+                    "submit",
+                    "provide",
+                    "requirements",
+                }
+            )
+    if query_type == "checklist":
+        out.update(
+            {
+                "required",
+                "requirements",
+                "bring",
+                "documents",
+                "items",
+                "submit",
+                "provide",
+                "checklist",
+            }
+        )
     if query_type == "product":
         out.update({"product", "feature", "manual", "guide", "calibrate", "button", "mode"})
         if "calibrat" in " ".join(tokens):

@@ -36,12 +36,24 @@ def split_questions(message: str) -> List[str]:
         item = re.sub(r"\s+", " ", item).strip(" \t-•")
         if not item:
             continue
+        item = _strip_leading_narrative(item)
         # Restore trailing ? for question-like clauses.
         if _looks_like_question(item) and not item.endswith("?"):
             item = item + "?"
         cleaned.append(item)
 
     return cleaned or [text]
+
+
+def _strip_leading_narrative(text: str) -> str:
+    """Keep interrogative clauses; drop leading scene-setting sentences."""
+    parts = re.split(r"(?<=[.!])\s+", text.strip())
+    if len(parts) <= 1:
+        return text.strip()
+    questions = [part for part in parts if _looks_like_question(part)]
+    if questions:
+        return " ".join(questions).strip()
+    return text.strip()
 
 
 def _split_on_question_marks(text: str) -> List[str]:
@@ -79,6 +91,11 @@ def _looks_like_question(text: str) -> bool:
     return bool(
         re.match(
             r"^(what|who|where|when|why|how|is|are|does|do|did|can|could|which|whose)\b",
+            lower,
+        )
+        or re.search(
+            r"(?:^|[.!]\s+)(?:what|who|where|when|why|how|is|are|does|do|did|"
+            r"can|could|which|whose)\b",
             lower,
         )
     )

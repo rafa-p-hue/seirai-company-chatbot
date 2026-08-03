@@ -6,7 +6,8 @@ from app.models.api import RetrievedChunk
 
 
 FALLBACK_ANSWER = (
-    "I could not find that information in the available document."
+    "I could not find that information in the available documents. "
+    "You may want to contact the organization directly for confirmation."
 )
 
 SYSTEM_PROMPT = """You are a document Q&A assistant.

@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Document Chatbot Prototype",
-  description: "Embeddable document-grounded chatbot interface.",
+  title: "Company Assistant",
+  description: "Document-grounded company chat assistant.",
 };
 
 export default function RootLayout({

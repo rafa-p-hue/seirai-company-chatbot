@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import asynccontextmanager
 from typing import Callable
 
 from fastapi import FastAPI, Request
@@ -11,9 +12,22 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import get_settings
-from app.routers import chat, documents, health, websites
+from app.database import init_database
+from app.routers import chat, chat_sessions, documents, health, websites
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_database()
+    try:
+        from app.services.index_recovery import recover_memory_index_if_empty
+
+        await recover_memory_index_if_empty()
+    except Exception:  # noqa: BLE001
+        logger.exception("Startup vector-index recovery failed")
+    yield
 
 
 def create_app() -> FastAPI:
@@ -27,6 +41,7 @@ def create_app() -> FastAPI:
         title="Seirai RAG Backend",
         version="0.1.0",
         description="Local-first company RAG service for PDF and website ingestion.",
+        lifespan=lifespan,
     )
 
     origins = settings.cors_origin_list()
@@ -34,7 +49,7 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=origins,
         allow_credentials=False,
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
 
@@ -90,6 +105,7 @@ def create_app() -> FastAPI:
     app.include_router(documents.router, prefix=settings.api_prefix)
     app.include_router(websites.router, prefix=settings.api_prefix)
     app.include_router(chat.router, prefix=settings.api_prefix)
+    app.include_router(chat_sessions.router, prefix=settings.api_prefix)
     return app
 
 

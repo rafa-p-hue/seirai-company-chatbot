@@ -56,7 +56,15 @@ def clean_linkedin_pages(pages: Sequence[ExtractedPage]) -> List[ExtractedPage]:
             seen.add(normalized)
             lines.append(line)
         cleaned.append(
-            ExtractedPage(page_number=page.page_number, text="\n".join(lines).strip())
+            ExtractedPage(
+                page_number=page.page_number,
+                text="\n".join(lines).strip(),
+                table_rows=page.table_rows,
+                slide_number=page.slide_number,
+                row_number=page.row_number,
+                section_heading=page.section_heading,
+                metadata=dict(page.metadata or {}),
+            )
         )
     return cleaned
 

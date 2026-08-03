@@ -1,20 +1,33 @@
 import { NextResponse } from "next/server";
-import { randomUUID } from "node:crypto";
 
-import { createUploadedDocument } from "@/lib/rag/document-memory";
-import { processDocument } from "@/lib/rag/process-document";
+import {
+  isSupportedUploadFile,
+  SUPPORTED_FORMAT_LABEL,
+} from "@/lib/supported-formats";
 
 export const runtime = "nodejs";
 
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
 
+function backendBase(): string {
+  return (
+    process.env.RAG_API_URL?.replace(/\/$/, "") ||
+    process.env.NEXT_PUBLIC_RAG_API_URL?.replace(/\/$/, "") ||
+    "http://127.0.0.1:8000"
+  );
+}
+
+/**
+ * Proxy multipart uploads to the FastAPI ingestion pipeline so all supported
+ * formats (PDF, DOCX, HTML, MD, CSV, PPTX) are accepted — not PDF-only.
+ */
 export async function POST(request: Request) {
   try {
     const contentType = request.headers.get("content-type") ?? "";
 
     if (!contentType.includes("multipart/form-data")) {
       return jsonError(
-        "Please send a multipart/form-data request with one PDF file.",
+        `Please send a multipart/form-data request with a file. Supported: ${SUPPORTED_FORMAT_LABEL}.`,
         415,
       );
     }
@@ -23,68 +36,60 @@ export async function POST(request: Request) {
     const file = formData.get("file");
 
     if (!(file instanceof File)) {
-      return jsonError("Please upload one PDF file.", 400);
+      return jsonError(
+        `Please upload a supported file (${SUPPORTED_FORMAT_LABEL}).`,
+        400,
+      );
     }
 
-    if (
-      file.type !== "application/pdf" &&
-      !file.name.toLowerCase().endsWith(".pdf")
-    ) {
-      return jsonError("Only PDF files can be processed.", 415);
+    if (!isSupportedUploadFile(file)) {
+      return jsonError(
+        `Unsupported file format. Supported: ${SUPPORTED_FORMAT_LABEL}.`,
+        415,
+      );
     }
 
     if (file.size > MAX_FILE_SIZE_BYTES) {
-      return jsonError("PDF files must be 10 MB or smaller.", 413);
+      return jsonError("Each file must be 10 MB or smaller.", 413);
     }
 
     if (file.size === 0) {
-      return jsonError("The uploaded PDF is empty.", 400);
+      return jsonError("The uploaded file is empty.", 400);
     }
 
-    const buffer = Buffer.from(await file.arrayBuffer());
-    const document = createUploadedDocument({
-      id: randomUUID(),
-      name: file.name,
-      mimeType: file.type || "application/pdf",
-      fileSize: file.size,
-      uploadedAt: new Date().toISOString(),
+    const upstream = await fetch(`${backendBase()}/api/documents/upload`, {
+      method: "POST",
+      body: formData,
     });
 
-    void processDocument({
-      documentId: document.id,
-      fileName: document.name,
-      mimeType: document.mimeType,
-      fileSize: document.fileSize,
-      buffer,
-    });
+    const text = await upstream.text();
+    let payload: unknown = null;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = { error: text || "Upload failed." };
+    }
 
-    return NextResponse.json(
-      {
-        document: {
-          id: document.id,
-          name: document.name,
-          status: document.status,
-          progress: document.progress,
-          message: document.message,
-        },
-      },
-      { status: 202 },
-    );
+    if (!upstream.ok) {
+      const message =
+        (payload as { detail?: string; error?: string } | null)?.detail ||
+        (payload as { detail?: string; error?: string } | null)?.error ||
+        `Upload failed (${upstream.status}).`;
+      return jsonError(String(message), upstream.status);
+    }
+
+    return NextResponse.json(payload, { status: upstream.status });
   } catch (error) {
     const message =
-      error instanceof Error
-        ? error.message
-        : "The PDF could not be processed.";
-
-    return jsonError(`The PDF could not be processed. ${message}`, 500);
+      error instanceof Error ? error.message : "The file could not be processed.";
+    return jsonError(`Upload failed. ${message}`, 500);
   }
 }
 
 export async function GET() {
   return NextResponse.json(
     {
-      message:
-        "Document upload API is ready. Send multipart/form-data with one PDF in the 'file' field.",
+      message: `Document upload API is ready. Supported formats: ${SUPPORTED_FORMAT_LABEL}. Send multipart/form-data with a file in the 'file' field.`,
     },
     { status: 200 },
   );

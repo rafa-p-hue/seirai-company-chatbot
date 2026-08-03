@@ -10,6 +10,9 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@next/swc-darwin-arm64": "^16.2.12",
+    "lightningcss": "^1.33.0",
+    "lightningcss-darwin-arm64": "^1.33.0",
     "next": "16.2.11",
     "pdf-parse": "^2.4.5",
     "react": "19.2.4",

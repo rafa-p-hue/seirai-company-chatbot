@@ -84,8 +84,11 @@ def is_requirement_sibling_payload(payload: Dict[str, Any]) -> bool:
         return True
     if DOCUMENT_OBJECT_RE.search(content) and (
         LIST_MARKER_START_RE.match(content.strip())
-        or ctype in {"list", "numbered_list"}
+        or ctype in {"list", "numbered_list", "key_value"}
         or REQUIREMENT_INTRO_RE.search(heading)
+        # Mid-sentence continuation of a bring list ("permission), your Moving-Out…").
+        or content[:1].islower()
+        or content.startswith((")", ",", "and ", "or "))
     ):
         return True
     return False
@@ -224,19 +227,29 @@ def expand_checklist_siblings(
         ).strip().lower()
         section_key = str(anchor.get("section_title") or "").strip().lower()
         neighbors = by_doc_section.get((doc_key, section_key), [])
+        # When the selected requirement is truncated, also walk same-document
+        # neighbors by chunk_index — PDF section titles often drift ("City Hall
+        # Hours") and hide the true continuation bullet.
+        same_doc = [
+            p
+            for p in all_payloads
+            if str(p.get("document_id") or p.get("document_name") or "")
+            .strip()
+            .lower()
+            == doc_key
+        ]
+        same_doc.sort(key=lambda p: int(p.get("chunk_index") or 0))
         if not neighbors and doc_key:
-            # Fallback: same document ordered by chunk_index — catch list
-            # continuations whose section_title drifted after packing.
-            same_doc = [
-                p
-                for p in all_payloads
-                if str(p.get("document_id") or p.get("document_name") or "")
-                .strip()
-                .lower()
-                == doc_key
-            ]
-            same_doc.sort(key=lambda p: int(p.get("chunk_index") or 0))
             neighbors = same_doc
+        elif diagnostics["incomplete_selected"] and same_doc:
+            # Merge unique same-doc payloads into the neighbor walk order.
+            seen_n = {str(p.get("chunk_id") or id(p)) for p in neighbors}
+            for payload in same_doc:
+                cid = str(payload.get("chunk_id") or id(payload))
+                if cid not in seen_n:
+                    neighbors.append(payload)
+                    seen_n.add(cid)
+            neighbors.sort(key=lambda p: int(p.get("chunk_index") or 0))
 
         diagnostics["section_chunks"] = section_chunks_diagnostic(
             [
@@ -285,27 +298,32 @@ def expand_checklist_siblings(
             added_payloads.append(payload)
             selected_ids.add(cid)
 
-        # Walk forward until the requirement list ends.
+        # Walk forward; skip non-requirement noise (hours/fees) instead of
+        # hard-stopping, so trailing document bullets still merge.
         for i in range(anchor_index + 1, len(neighbors)):
             payload = neighbors[i]
             if not is_requirement_sibling_payload(payload):
-                # Stop at first non-requirement neighbor in the section.
-                break
+                content = str(payload.get("content") or "")
+                # Hard-stop only on clear section breaks / unrelated domains.
+                if re.search(
+                    r"(?i)\b(office\s+hours|fee\s+schedule|contact\s+us|"
+                    r"moving\s+out|garbage|recycling)\b",
+                    f"{payload.get('section_title') or ''}\n{content[:80]}",
+                ):
+                    break
+                continue
             cid = str(payload.get("chunk_id") or id(payload))
             if cid in selected_ids:
                 continue
             added_payloads.append(payload)
             selected_ids.add(cid)
-            # Prefer stopping once we no longer look incomplete after merge preview.
             preview = "\n".join(
                 str(p.get("content") or "")
                 for p in ([anchor] + added_payloads)
             )
             if not requirement_list_looks_incomplete(preview):
-                # Keep going only while neighbors are contiguous list bullets.
                 nxt = neighbors[i]
                 if not LIST_MARKER_START_RE.match(str(nxt.get("content") or "").strip()):
-                    # Already added this one; next iteration may stop.
                     pass
 
     diagnostics["siblings_added"] = [

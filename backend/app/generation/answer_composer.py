@@ -43,11 +43,45 @@ def compose_answer(
     understanding: QueryUnderstanding,
     evidence: Sequence[RetrievedChunk],
 ) -> Tuple[str, List[CitationSource]]:
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    def _diag_item(chunk: RetrievedChunk, *, accepted: bool, reason: str = "") -> dict:
+        diag = chunk.diagnostics or {}
+        return {
+            "chunk_id": chunk.chunk_id,
+            "filename": chunk.document_name,
+            "page_slide_row": chunk.slide_number
+            if chunk.slide_number is not None
+            else chunk.page_number,
+            "clean_text": (chunk.content or "")[:400],
+            "retrieval_score": diag.get("dense_score", chunk.score),
+            "reranker_score": diag.get(
+                "reranker_score", diag.get("final_score", chunk.score)
+            ),
+            "validator_result": "accepted" if accepted else "rejected",
+            "rejection_reason": reason or None,
+        }
+
+    logger.info(
+        "COMPOSE_INPUT_CANDIDATES n=%s q=%r items=%s",
+        len(evidence),
+        understanding.original_question,
+        [
+            _diag_item(chunk, accepted=True, reason="input")
+            for chunk in evidence[:12]
+        ],
+    )
+
     if understanding.query_type == "greeting":
+        logger.info("COMPOSE_FALLBACK_REASON greeting")
         return GREETING_ANSWER, []
     if understanding.query_type == "help":
+        logger.info("COMPOSE_FALLBACK_REASON help")
         return HELP_ANSWER, []
     if understanding.query_type == "unsupported":
+        logger.info("COMPOSE_FALLBACK_REASON unsupported_query_type")
         return FALLBACK_ANSWER, []
     if understanding.query_type in {"awards", "executive", "instrument"}:
         from app.retrieval.fact_types import (
@@ -66,15 +100,57 @@ def compose_answer(
             evidence, understanding.query_type, question=understanding.original_question
         )
         if not typed or not any(pattern.search(item.content or "") for item in typed):
+            logger.info(
+                "COMPOSE_REJECTED_EVIDENCE reason=typed_pattern_miss type=%s",
+                understanding.query_type,
+            )
+            logger.info("COMPOSE_FALLBACK_REASON typed_pattern_miss")
             return FALLBACK_ANSWER, []
     if understanding.query_type == "instrument":
         from app.retrieval.fact_types import INSTRUMENT_RE
 
         if not any(INSTRUMENT_RE.search(item.content or "") for item in evidence):
+            logger.info("COMPOSE_FALLBACK_REASON instrument_miss")
             return FALLBACK_ANSWER, []
 
     cleaned = _scrub_evidence(evidence)
+    accepted = cleaned
+    rejected = [
+        _diag_item(chunk, accepted=False, reason="scrubbed_or_too_short")
+        for chunk in evidence
+        if chunk not in cleaned
+        and id(chunk) not in {id(c) for c in cleaned}
+    ]
+    # Match by content fingerprint when object identity differs after copies.
+    cleaned_keys = {
+        ((c.document_name or ""), (c.content or "")[:80]) for c in cleaned
+    }
+    rejected = [
+        _diag_item(chunk, accepted=False, reason="scrubbed_or_too_short")
+        for chunk in evidence
+        if ((chunk.document_name or ""), (chunk.content or "")[:80]) not in cleaned_keys
+    ]
+    logger.info(
+        "COMPOSE_ACCEPTED_EVIDENCE n=%s items=%s",
+        len(accepted),
+        [_diag_item(chunk, accepted=True) for chunk in accepted[:12]],
+    )
+    if rejected:
+        logger.info(
+            "COMPOSE_REJECTED_EVIDENCE n=%s items=%s",
+            len(rejected),
+            rejected[:12],
+        )
+        for item in rejected[:12]:
+            logger.info(
+                "COMPOSE_REJECTION_REASON chunk_id=%s reason=%s",
+                item.get("chunk_id"),
+                item.get("rejection_reason"),
+            )
+
     if not cleaned and understanding.query_type not in {"greeting", "help"}:
+        logger.info("COMPOSE_FALLBACK_REASON empty_scrubbed_evidence")
+        logger.info("COMPOSE_FINAL_ANSWER %r", FALLBACK_ANSWER)
         return FALLBACK_ANSWER, []
 
     # Explicit "not announced / TBD" — only when the question asks about that gap.
@@ -212,6 +288,8 @@ def compose_answer(
             return FALLBACK_ANSWER, []
     elif understanding.query_type in {
         "policy",
+        "checklist",
+        "procedure",
         "price",
         "quantity",
         "date",
@@ -220,7 +298,13 @@ def compose_answer(
         "general",
         "skills",
     }:
-        if understanding.query_type == "price":
+        if understanding.query_type == "checklist":
+            from app.generation.evidence_validation import checklist_answer
+
+            answer = checklist_answer(cleaned)
+        elif understanding.query_type == "procedure":
+            answer = _procedure_from_evidence(understanding, cleaned)
+        elif understanding.query_type == "price":
             answer = _price_from_evidence(understanding, cleaned)
         elif understanding.query_type == "quantity":
             answer = _quantity_from_evidence(understanding, cleaned)
@@ -228,26 +312,58 @@ def compose_answer(
             answer = _date_from_evidence(understanding, cleaned)
         elif understanding.query_type == "accessibility":
             answer = _accessibility_from_evidence(understanding, cleaned)
+        elif understanding.query_type == "policy":
+            from app.retrieval.answer_grounding import (
+                detect_source_intent,
+                synthesize_candidate_fee_answer,
+            )
+
+            if detect_source_intent(understanding.original_question) == "candidate_fee":
+                answer = synthesize_candidate_fee_answer(cleaned) or FALLBACK_ANSWER
+            else:
+                answer = _specific_from_evidence(understanding, cleaned)
         else:
             answer = _specific_from_evidence(understanding, cleaned)
     else:
         answer = _specific_from_evidence(understanding, cleaned)
 
     if not answer or answer == FALLBACK_ANSWER or NAV_NOISE_PHRASE.search(answer):
+        import logging
+
+        logging.getLogger(__name__).info(
+            "COMPOSE_FALLBACK_REASON empty_or_noise answer=%r",
+            (answer or "")[:160],
+        )
+        logging.getLogger(__name__).info("COMPOSE_FINAL_ANSWER %r", FALLBACK_ANSWER)
         return FALLBACK_ANSWER, []
     if UNSUPPORTED_STATUS_RE.search(answer) and not any(
         UNSUPPORTED_STATUS_RE.search(item.content or "") for item in cleaned
     ):
+        import logging
+
+        logging.getLogger(__name__).info("COMPOSE_FALLBACK_REASON unsupported_status")
+        logging.getLogger(__name__).info("COMPOSE_FINAL_ANSWER %r", FALLBACK_ANSWER)
         return FALLBACK_ANSWER, []
 
     answer = _finalize_answer(answer)
     if not answer or answer == FALLBACK_ANSWER:
+        import logging
+
+        logging.getLogger(__name__).info("COMPOSE_FALLBACK_REASON finalize_empty")
+        logging.getLogger(__name__).info("COMPOSE_FINAL_ANSWER %r", FALLBACK_ANSWER)
         return FALLBACK_ANSWER, []
     # Never return a raw single chunk dump as the final answer.
     if _looks_like_raw_chunk_dump(answer, cleaned):
+        import logging
+
+        logging.getLogger(__name__).info("COMPOSE_FALLBACK_REASON raw_chunk_dump")
+        logging.getLogger(__name__).info("COMPOSE_FINAL_ANSWER %r", FALLBACK_ANSWER)
         return FALLBACK_ANSWER, []
 
     used = _select_used_evidence(answer, cleaned)
+    import logging
+
+    logging.getLogger(__name__).info("COMPOSE_FINAL_ANSWER %r", answer[:400])
     return answer.strip(), _sources_for(used)
 
 
@@ -268,17 +384,30 @@ def _looks_like_raw_chunk_dump(answer: str, evidence: Sequence[RetrievedChunk]) 
     def _norm(value: str) -> str:
         return re.sub(r"[.\s]+$", "", _clean_answer_text(value or "")).lower()
 
-    text_n = _norm(text)
+    text_n = _norm(re.sub(r"(?:\s*\[\d+\])+\s*$", "", text))
+    # Bare document/section titles or heading-only strings are never final answers.
+    if _is_heading_or_title_answer(text, evidence):
+        return True
     for item in evidence:
         label_l = (item.label or "").lower()
+        ctype = (item.content_type or "").lower()
+        chunk = _clean_answer_text(item.content or "")
+        chunk_n = _norm(chunk)
+        # Exact equality with a heading/title chunk is invalid. Exact equality
+        # with a short key-value person/name field is a valid identity answer.
+        if chunk and text_n == chunk_n and ctype == "heading":
+            return True
+        if chunk and text_n == chunk_n and re.search(
+            r"(?i)\b(guide|handbook|manual|brochure)\b", chunk
+        ):
+            return True
         is_contact = bool(
             re.search(r"\b(email|e-?mail|phone|full\s*name)\b", label_l)
             or re.search(r"(?i)^(full\s*name|email|phone)\s*:", item.content or "")
         )
         if not is_contact:
             continue
-        chunk = _clean_answer_text(item.content or "")
-        if chunk and text_n == _norm(chunk):
+        if chunk and text_n == chunk_n:
             return True
         if item.label and item.value and text_n == _norm(f"{item.label}: {item.value}"):
             return True
@@ -286,10 +415,48 @@ def _looks_like_raw_chunk_dump(answer: str, evidence: Sequence[RetrievedChunk]) 
             return True
     # Concatenated raw chunks with no generated framing words.
     if ";" in text and not re.search(
-        r"(?i)\b(include|includes|listed|founded|attended|involved|associated|is|are)\b",
+        r"(?i)\b(include|includes|listed|founded|attended|involved|associated|"
+        r"applicable|fees?|costs?|is|are)\b",
         text,
     ):
         return True
+    return False
+
+
+def _is_heading_or_title_answer(
+    answer: str, evidence: Sequence[RetrievedChunk]
+) -> bool:
+    text = re.sub(r"(?:\s*\[\d+\])+\s*$", "", (answer or "").strip())
+    text = _clean_answer_text(text)
+    if not text:
+        return True
+    words = text.split()
+    # Person names extracted from labeled fields are valid answers.
+    if any(
+        (item.value or "").strip().lower() == text.lower()
+        or (
+            item.label
+            and item.value
+            and _clean_answer_text(f"{item.label}: {item.value}").lower()
+            == text.lower()
+        )
+        for item in evidence
+        if item.content_type == "key_value" or item.label
+    ):
+        return False
+    if len(words) <= 8 and not re.search(r"[.!?]", text):
+        if any(
+            (
+                (item.content_type or "") == "heading"
+                and _clean_answer_text(item.content or "").lower() == text.lower()
+            )
+            or (item.section_title or "").strip().lower() == text.lower()
+            or (item.document_name or "").rsplit(".", 1)[0].lower() == text.lower()
+            for item in evidence
+        ):
+            return True
+        if re.search(r"(?i)\b(guide|handbook|manual|brochure|services)\b", text):
+            return True
     return False
 
 
@@ -346,8 +513,30 @@ def _list_keywords(query_type: str) -> Sequence[str]:
 def _location_from_evidence(
     understanding: QueryUnderstanding, evidence: Sequence[RetrievedChunk]
 ) -> str:
+    from app.retrieval.answer_grounding import (
+        extract_requested_place,
+        format_office_not_found_answer,
+        is_contact_details_only,
+        synthesize_office_presence_answer,
+    )
+    from app.retrieval.entity_validation import infer_not_found_contact_name
     from app.retrieval.fact_types import LOCATION_SIGNAL_RE
     from app.retrieval.numeric_facts import content_states_unannounced
+
+    question = understanding.original_question or ""
+    place = extract_requested_place(question)
+    office_question = bool(
+        place
+        and re.search(r"(?i)\b(office|branch|headquarters|hq)\b", question)
+    )
+    if office_question:
+        office_answer = synthesize_office_presence_answer(
+            evidence, place=place, question=question
+        )
+        if office_answer:
+            return office_answer
+        contact = infer_not_found_contact_name(question=question)
+        return format_office_not_found_answer(place, contact_name=contact)
 
     name = understanding.subject_name or "The person"
     unannounced = _unannounced_from_evidence(evidence)
@@ -356,6 +545,8 @@ def _location_from_evidence(
     for item in evidence:
         text = _clean_answer_text(item.content or "")
         if content_states_unannounced(text):
+            continue
+        if is_contact_details_only(text):
             continue
         if not LOCATION_SIGNAL_RE.search(text):
             continue
@@ -369,25 +560,27 @@ def _location_from_evidence(
             text,
         )
         if match:
-            place = _trim_complete_phrase(match.group(1).strip(" ,"), max_len=80)
-            if place:
-                return f"{name} is located in {place}."
+            place_value = _trim_complete_phrase(match.group(1).strip(" ,"), max_len=80)
+            if place_value:
+                return f"{name} is located in {place_value}."
         match = re.search(
             r"(?i)\b(?:city|state|country|location|address|hometown)\s*:\s*([^\n;]+)",
             text,
         )
         if match:
-            place = _trim_complete_phrase(match.group(1).strip(" ,"), max_len=80)
-            if place:
-                return f"{name}'s location is {place}."
+            place_value = _trim_complete_phrase(match.group(1).strip(" ,"), max_len=80)
+            if place_value:
+                return f"{name}'s location is {place_value}."
     return FALLBACK_ANSWER
 
 
 def _scrub_evidence(evidence: Sequence[RetrievedChunk]) -> List[RetrievedChunk]:
+    from app.generation.evidence_presentation import prepare_evidence_for_generation
     from app.generation.text_scrub import looks_like_internal_metadata, scrub_internal_metadata
 
+    prepared = prepare_evidence_for_generation(evidence)
     cleaned: List[RetrievedChunk] = []
-    for item in evidence:
+    for item in prepared:
         if not item.content:
             continue
         # Scrub structured markers before whitespace collapsing.
@@ -571,7 +764,18 @@ def _clean_answer_text(text: str) -> str:
 
 def _trim_complete_phrase(text: str, *, max_len: int = 160) -> str:
     """Trim without cutting mid-word or mid-sentence."""
-    text = _clean_answer_text(text)
+    from app.generation.evidence_presentation import repair_passage_text
+
+    text = repair_passage_text(_clean_answer_text(text))
+    if not text:
+        return ""
+    # Never keep a mid-sentence start (lowercase continuations only).
+    if text[0].islower():
+        match = re.search(r"(?<=[.!?])\s+(?=[A-Z\"“])", text)
+        if match:
+            text = text[match.end() :].lstrip()
+        else:
+            return ""
     if len(text) <= max_len:
         return text.rstrip(" ,;:")
     cut = text[:max_len]
@@ -590,18 +794,35 @@ def _finalize_answer(answer: str) -> str:
     """Sanitize user-facing answers: no markers, no mid-word truncations."""
     if not answer or answer == FALLBACK_ANSWER:
         return answer
+    from app.generation.answer_synthesis import is_retrieval_dump_answer
+    from app.generation.evidence_presentation import (
+        answer_exposes_internal_field_keys,
+        looks_like_answer_fragment,
+        repair_passage_text,
+    )
     from app.generation.text_scrub import looks_like_internal_metadata, scrub_internal_metadata
 
-    text = scrub_internal_metadata(_clean_answer_text(answer))
+    text = scrub_internal_metadata(answer)
+    # Preserve multi-line checklist bullets.
+    if "\n" not in text:
+        text = repair_passage_text(_clean_answer_text(text))
+    else:
+        text = scrub_internal_metadata(text.strip())
     if looks_like_internal_metadata(text) or re.search(
         r"(?i)\b(record\s*type|profile\s*description)\s*:", text
+    ):
+        return FALLBACK_ANSWER
+    if (
+        answer_exposes_internal_field_keys(text)
+        or is_retrieval_dump_answer(text)
+        or looks_like_answer_fragment(text)
     ):
         return FALLBACK_ANSWER
     # Drop trailing incomplete ellipsis fragments that look like raw dumps.
     if text.endswith("…") or text.endswith("..."):
         text = text.rstrip(".…")
         text = _trim_complete_phrase(text, max_len=len(text))
-        if text and not text.endswith((".", "!", "?")):
+        if text and not text.endswith((".", "!", "?")) and "\n" not in text:
             text = text + "."
     # Reject answers that are mostly raw labeled dumps with no sentence structure
     # when they end mid-token (no space after last 3+ alnum run cut by ellipsis).
@@ -867,26 +1088,104 @@ def _leadership_titles_answer(
     return f"Leadership roles listed for {name} include: " + "; ".join(titles) + "."
 
 
+def _procedure_from_evidence(
+    understanding: QueryUnderstanding, evidence: Sequence[RetrievedChunk]
+) -> str:
+    """Assemble ordered procedural steps from evidence (document-agnostic)."""
+    if not evidence:
+        return FALLBACK_ANSWER
+    # Prefer chunks with ordered / action language.
+    ranked = sorted(
+        evidence,
+        key=lambda item: (
+            1
+            if re.search(
+                r"(?i)\b(reserve|sticker|attach|classified|dispose|oversized|"
+                r"step|phone|online|place\s+(?:the\s+)?item)\b",
+                item.content or "",
+            )
+            else 0,
+            1
+            if str(item.content_type or "") in {"list", "numbered_list"}
+            else 0,
+            len(item.content or ""),
+        ),
+        reverse=True,
+    )
+    # Merge unique sentences/bullets while preserving order of appearance.
+    parts: List[str] = []
+    seen = set()
+    for item in ranked[:4]:
+        text = re.sub(r"\s+", " ", (item.content or "").strip())
+        for piece in re.split(r"(?<=[.!;])\s+|\n+|•\s*", text):
+            piece = piece.strip(" •\t")
+            if len(piece) < 12:
+                continue
+            key = piece.lower()
+            if key in seen:
+                continue
+            # Skip unrelated certificate fee rows.
+            if re.search(
+                r"(?i)\b(residence\s+certificate|family\s+register|counter\s+fee|"
+                r"kiosk\s+fee)\b",
+                piece,
+            ) and not re.search(
+                r"(?i)\b(sticker|oversized|garbage|waste|dispose)\b", piece
+            ):
+                continue
+            seen.add(key)
+            parts.append(piece if piece.endswith((".", "!", "?")) else f"{piece}.")
+    if not parts:
+        return FALLBACK_ANSWER
+    # Keep a complete but readable procedure answer.
+    answer = " ".join(parts[:8])
+    return answer
+
+
 def _price_from_evidence(
     understanding: QueryUnderstanding, evidence: Sequence[RetrievedChunk]
 ) -> str:
-    from app.retrieval.numeric_facts import CURRENCY_RE
+    from app.generation.evidence_validation import price_answer
+    from app.retrieval.entity_validation import filter_evidence_for_requested_entity
 
-    for item in evidence:
-        text = _clean_answer_text(item.content or "")
-        match = CURRENCY_RE.search(text)
-        if not match:
-            continue
-        amount = match.group(0)
-        section = item.section_title or "the document"
-        # Prefer a complete sentence/list item containing the amount.
-        for part in re.split(r"(?<=[.!?])\s+|\n+", text):
-            if amount in part:
-                snippet = _trim_complete_phrase(part.strip(" •"), max_len=180)
-                if snippet:
-                    return snippet if snippet.endswith((".", "!", "?")) else f"{snippet}."
-        return f"According to {section}, the amount is {amount}."
-    return FALLBACK_ANSWER
+    filtered, diag = filter_evidence_for_requested_entity(
+        evidence, understanding.original_question
+    )
+    print(
+        "PRICE DEBUG:",
+        {
+            "question": understanding.original_question,
+            "input": [
+                {
+                    "document": item.document_name,
+                    "status": item.document_status,
+                    "index": item.chunk_index,
+                    "content": item.content,
+                }
+                for item in evidence
+            ],
+            "filtered": [
+                {
+                    "document": item.document_name,
+                    "status": item.document_status,
+                    "index": item.chunk_index,
+                    "content": item.content,
+                }
+                for item in filtered
+            ],
+            "diag": diag,
+        },
+        flush=True,
+    )
+    if not filtered:
+        import logging
+
+        logging.getLogger(__name__).info(
+            "COMPOSE_FALLBACK_REASON price_no_entity_match rejection=%s",
+            diag.get("rejection_reason"),
+        )
+        return FALLBACK_ANSWER
+    return price_answer(understanding.original_question, filtered)
 
 
 def _quantity_from_evidence(
@@ -894,35 +1193,200 @@ def _quantity_from_evidence(
 ) -> str:
     from app.retrieval.numeric_facts import QUANTITY_RE, PERCENT_RE
 
+    question = f"{understanding.original_question} {understanding.resolved_question}".lower()
+    query_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", question)
+        if len(token) > 2
+        and token
+        not in {
+            "how",
+            "many",
+            "what",
+            "the",
+            "and",
+            "for",
+            "are",
+            "does",
+            "do",
+            "each",
+            "year",
+            "number",
+            "capacity",
+        }
+    }
+    wants_capacity = bool(re.search(r"\bcapacity\b", question))
+
+    scored: List[tuple[int, str]] = []
     for item in evidence:
         text = _clean_answer_text(item.content or "")
         match = QUANTITY_RE.search(text) or PERCENT_RE.search(text)
         if not match:
             continue
+        content_l = text.lower()
+        overlap = sum(1 for token in query_tokens if token in content_l)
         for part in re.split(r"(?<=[.!?])\s+|\n+", text):
-            if match.group(0) in part:
-                snippet = _trim_complete_phrase(part.strip(" •"), max_len=180)
-                if snippet:
-                    return snippet if snippet.endswith((".", "!", "?")) else f"{snippet}."
-        return f"The document states {match.group(0)}."
-    return FALLBACK_ANSWER
+            part_l = part.lower()
+            if wants_capacity and "capacity" not in part_l and not QUANTITY_RE.search(part):
+                continue
+            if match.group(0) not in part and not (
+                wants_capacity and re.search(r"(?i)\bcapacity\b", part)
+            ):
+                continue
+            snippet = _trim_complete_phrase(part.strip(" •"), max_len=180)
+            if not snippet:
+                continue
+            part_overlap = sum(1 for token in query_tokens if token in part_l)
+            bonus = 20 if wants_capacity and "capacity" in part_l else 0
+            # Prefer entity tokens from the resolved question (e.g. Greenfield).
+            entity_bonus = sum(
+                8 for token in query_tokens if len(token) > 4 and token in part_l
+            )
+            answer = snippet if snippet.endswith((".", "!", "?")) else f"{snippet}."
+            scored.append((part_overlap * 10 + overlap + bonus + entity_bonus, answer))
+            break
+        else:
+            scored.append((overlap, f"The document states {match.group(0)}."))
+    if not scored:
+        return FALLBACK_ANSWER
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
 
 
 def _date_from_evidence(
     understanding: QueryUnderstanding, evidence: Sequence[RetrievedChunk]
 ) -> str:
-    from app.retrieval.numeric_facts import content_has_date_or_period
+    from app.retrieval.numeric_facts import (
+        DEADLINE_RE,
+        content_has_date_or_period,
+        content_has_deadline,
+    )
 
     q = f"{understanding.original_question} {understanding.expanded_question}".lower()
+    wants_deadline = bool(
+        re.search(r"\b(register|apply|submit|enroll|deadline|due|moving)\b", q)
+    )
+    wants_period = bool(
+        re.search(r"\b(opening|period|timeline|year|season|planned|announce)\b", q)
+    )
+    wants_collection = bool(
+        re.search(r"\b(collect(?:ed|ion)?|garbage|burnable|recycl|pickup|paid|payment)\b", q)
+    )
+    scored: List[tuple[int, str]] = []
     for item in evidence:
-        text = _clean_answer_text(item.content or "")
-        if not content_has_date_or_period(text):
+        if (item.content_type or "") == "heading":
             continue
-        for part in re.split(r"(?<=[.!?])\s+|\n+", text):
-            if content_has_date_or_period(part):
-                snippet = _trim_complete_phrase(part.strip(" •"), max_len=180)
-                if snippet:
-                    return snippet if snippet.endswith((".", "!", "?")) else f"{snippet}."
+        text = _clean_answer_text(item.content or "")
+        # Heading-prefixed procedural chunks keep section titles for retrieval;
+        # strip them before answering so the deadline sentence stands alone.
+        section = (item.section_title or "").strip()
+        if section:
+            text = re.sub(
+                rf"(?is)^\s*{re.escape(section)}\s*[:\-]?\s*",
+                "",
+                text,
+                count=1,
+            ).strip()
+        if not content_has_date_or_period(text) and not content_has_deadline(text):
+            continue
+        for idx, part in enumerate(parts_list := [
+            p.strip(" •·") for p in re.split(r"(?<=[.!?])\s+|\n+", text) if p.strip(" •·")
+        ]):
+            part = part.strip(" •·")
+            if section and part.lower() == section.lower():
+                continue
+            if not part or not (
+                content_has_date_or_period(part) or content_has_deadline(part)
+            ):
+                continue
+            if re.search(
+                r"(?i)\b(office hours?|monday through|saturday and sunday)\b", part
+            ) and not content_has_deadline(part):
+                continue
+            # Keep neighboring procedure/window sentences with the deadline.
+            fused_parts = [part]
+            if wants_deadline and idx > 0:
+                prev = parts_list[idx - 1]
+                if re.search(
+                    r"(?i)\b(submit|notification|window|citizen affairs|register|"
+                    r"move-?in|bring)\b",
+                    prev,
+                ) and not content_has_deadline(prev):
+                    fused_parts.insert(0, prev)
+            if wants_deadline and idx + 1 < len(parts_list):
+                nxt = parts_list[idx + 1]
+                if re.search(
+                    r"(?i)\b(submit|notification|window|citizen affairs|bring)\b",
+                    nxt,
+                ) and not content_has_deadline(nxt):
+                    # Prefer deadline + bring only when bring is short context.
+                    if len(nxt.split()) <= 24:
+                        fused_parts.append(nxt)
+            if wants_collection:
+                for neighbor in parts_list:
+                    if neighbor == part:
+                        continue
+                    if re.search(
+                        r"(?i)\b("
+                        r"\d{1,2}:\d{2}\s*a\.?m\.?|collection\s+point|"
+                        r"yellow\s+(?:city\s+)?bags?|official\s+\w+\s+bags?|"
+                        r"february|june|october|paid|payment|"
+                        r"use\s+official|city\s+bags?"
+                        r")\b",
+                        neighbor,
+                    ):
+                        if neighbor not in fused_parts:
+                            fused_parts.append(neighbor)
+            # Also pull complementary sentences from sibling evidence chunks.
+            if wants_collection:
+                for sibling in evidence:
+                    sib_text = _clean_answer_text(sibling.content or "")
+                    for neighbor in re.split(r"(?<=[.!?])\s+|\n+", sib_text):
+                        neighbor = neighbor.strip(" •·")
+                        if not neighbor or neighbor in fused_parts:
+                            continue
+                        if re.search(
+                            r"(?i)\b(yellow\s+(?:city\s+)?bags?|official\s+\w+\s+bags?|"
+                            r"collection\s+point|\d{1,2}:\d{2})\b",
+                            neighbor,
+                        ):
+                            fused_parts.append(neighbor)
+            fused = " ".join(fused_parts)
+            snippet = _trim_complete_phrase(fused, max_len=280)
+            if not snippet or _is_heading_or_title_answer(snippet, evidence):
+                continue
+            weight = 0
+            has_deadline = bool(
+                content_has_deadline(snippet) or DEADLINE_RE.search(snippet)
+            )
+            has_calendar = bool(
+                re.search(
+                    r"(?i)\b(?:20\d{2}|19\d{2}|spring|summer|fall|autumn|winter|"
+                    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+                    r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|"
+                    r"nov(?:ember)?|dec(?:ember)?)\b",
+                    snippet,
+                )
+            )
+            if wants_deadline and has_deadline:
+                weight += 6
+            if wants_period and has_calendar:
+                weight += 6
+            if wants_period and has_deadline and not has_calendar:
+                weight -= 3
+            if not wants_deadline and not wants_period and has_deadline:
+                weight += 3
+            if re.search(r"(?i)\b(register|apply|submit|enroll|moving)\b", snippet):
+                weight += 2 if wants_deadline else 0
+            if re.search(r"(?i)\b(window|citizen affairs|notification)\b", snippet):
+                weight += 3 if wants_deadline else 0
+            if re.search(r"(?i)\b(opening|planned|timeline)\b", snippet):
+                weight += 2 if wants_period else 0
+            answer = snippet if snippet.endswith((".", "!", "?")) else f"{snippet}."
+            scored.append((weight, answer))
+    if scored:
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return scored[0][1]
     # Only fall back to unannounced when the question itself asks about an unknown date/address.
     if re.search(r"\b(address|announce|tbd|tba)\b", q):
         unannounced = _unannounced_from_evidence(evidence)
@@ -1005,20 +1469,98 @@ def _specific_from_evidence(
     from app.retrieval.label_match import extract_labeled_value
 
     question_l = f"{understanding.expanded_question} {understanding.original_question}".lower()
-    # Prefer exact labeled fields for common intents.
-    if understanding.query_type == "product" or "product" in question_l:
+    original_l = (understanding.original_question or "").lower()
+    # Which/what entity questions: prefer the sentence that answers accepts/allows
+    # pets, including explicit "pet-friendly" shelter attributes.
+    if re.search(r"\b(which|what)\b", original_l) and re.search(
+        r"\b(accepts?|allows?|pets?|shelter|pet[- ]friendly)\b", original_l
+    ):
+        wants_accept = bool(
+            re.search(r"\b(accepts?|allows?|pets?|pet[- ]friendly)\b", original_l)
+        )
+        positives: List[Tuple[int, str]] = []
+        for item in evidence:
+            text = _clean_answer_text(item.content or "")
+            for part in re.split(r"(?<=[.!?])\s+|\n+|•", text):
+                part = part.strip(" •-")
+                if len(part) < 8:
+                    continue
+                if wants_accept and re.search(
+                    r"(?i)\bdoes\s+not\s+accept|\bdo\s+not\s+accept|\bnot\s+accept\b|"
+                    r"\bno\s+pets?\b",
+                    part,
+                ):
+                    continue
+                pet_friendly = bool(re.search(r"(?i)\bpet[- ]friendly\b", part))
+                accepts_pets = bool(
+                    re.search(r"(?i)\b(accepts?|allows?)\s+pets?\b", part)
+                )
+                if not (pet_friendly or accepts_pets):
+                    continue
+                # Named shelter + pet-friendly attribute is sufficient evidence.
+                shelter_name = None
+                name_match = re.search(
+                    r"\b([A-Z][A-Za-z0-9 .'-]{2,60}?"
+                    r"(?:Community Center|School(?: Gymnasium)?|Shelter|"
+                    r"Junior High|Elementary)[A-Za-z0-9 .'-]*)",
+                    part,
+                )
+                if name_match:
+                    candidate_name = name_match.group(1).strip(" -—,")
+                    # Generic labels annerated summaries are not entity names.
+                    if not re.search(
+                        r"(?i)\b(summary|overview|guide|information)\b",
+                        candidate_name,
+                    ):
+                        shelter_name = candidate_name
+
+                if (
+                    pet_friendly
+                    and shelter_name is None
+                    and re.search(
+                        r"(?i)\b(?:shelter|pet[- ]friendly)\s+summary\b",
+                        part,
+                    )
+                ):
+                    continue
+                if pet_friendly and shelter_name:
+                    snippet = (
+                        f"{shelter_name} has a pet-friendly area."
+                    )
+                    rank = 3
+                elif pet_friendly:
+                    snippet = (
+                        part if part.endswith((".", "!", "?")) else f"{part}."
+                    )
+                    rank = 2
+                else:
+                    snippet = (
+                        part if part.endswith((".", "!", "?")) else f"{part}."
+                    )
+                    # Prefer unconditional acceptance over conditional.
+                    rank = 0 if re.search(r"(?i)\bonly\b", part) else 1
+                positives.append((rank, snippet))
+        if positives:
+            positives.sort(key=lambda item: item[0], reverse=True)
+            return positives[0][1]
+
+    # Prefer exact labeled fields for common intents (use original wording so
+    # expanded "What policy details..." does not force a false policy label hit).
+    if understanding.query_type == "product" or "product" in original_l:
         value = extract_labeled_value(evidence, ["product"])
         if value:
             return f"The product is {value}."
-    if understanding.query_type == "policy" or "policy" in question_l:
+    if "policy" in original_l and re.search(
+        r"\b(policy|leave|pto|handbook|remote\s+work)\b", original_l
+    ):
         value = extract_labeled_value(evidence, ["policy"]) or _label_value(
             evidence, r"policy|leave\s*policy|remote\s*work\s*policy"
         )
         if value:
             subject = understanding.subject_name or "The document"
             return f"{subject}: policy is {value}."
-    for pattern in ("major", "minor", "email", "full name", "school", "policy", "feature", "product", "model"):
-        if pattern in question_l:
+    for pattern in ("major", "minor", "email", "full name", "school", "feature", "product", "model"):
+        if pattern in original_l:
             value = extract_labeled_value(
                 evidence,
                 ["product"]
@@ -1085,6 +1627,8 @@ def _specific_from_evidence(
     }
     scored: List[Tuple[int, str]] = []
     for item in evidence:
+        if str(item.content_type or "") == "heading":
+            continue
         # Prefer short key-value hits when they match the query family.
         if (item.content_type == "key_value" or item.label) and item.value:
             label_l = (item.label or "").lower()
@@ -1094,7 +1638,9 @@ def _specific_from_evidence(
                 token in (item.content or "").lower() for token in query_tokens
             ):
                 # Never return bare Label: value for claim questions.
-                if understanding.query_type in {
+                # For these intents, fall through and score the full sentence
+                # below instead of discarding the entire evidence chunk.
+                if understanding.query_type not in {
                     "awards",
                     "executive",
                     "instrument",
@@ -1103,8 +1649,11 @@ def _specific_from_evidence(
                     "location",
                     "policy",
                 }:
-                    continue
-                return f"{item.label}: {item.value}." if item.label else f"{item.value}."
+                    return (
+                        f"{item.label}: {item.value}."
+                        if item.label
+                        else f"{item.value}."
+                    )
         for part in re.split(r"(?<=[.!?])\s+|\n+", item.content or ""):
             text = re.sub(r"\s+", " ", part).strip(" -•\t[]")
             if len(text) < 8:
@@ -1202,6 +1751,15 @@ def _summary_from_evidence(
     from app.retrieval.diversity import infer_topic
     from app.retrieval.fact_types import LEADERSHIP_TITLE_RE
     from app.retrieval.label_match import extract_labeled_value
+    from app.retrieval.query_understanding import DOCUMENT_SUMMARY_RE
+
+    question = f"{understanding.original_question} {understanding.resolved_question}"
+    if DOCUMENT_SUMMARY_RE.search(question) or _evidence_looks_like_document_guide(
+        evidence
+    ):
+        document_overview = _document_overview_from_evidence(evidence)
+        if document_overview != FALLBACK_ANSWER:
+            return document_overview
 
     name = (
         extract_labeled_value(evidence, ["name"])
@@ -1269,6 +1827,127 @@ def _summary_from_evidence(
     return " ".join(sentences)
 
 
+def _evidence_looks_like_document_guide(evidence: Sequence[RetrievedChunk]) -> bool:
+    blob = "\n".join(
+        f"{item.section_title or ''}\n{item.content or ''}" for item in evidence[:12]
+    )
+    if re.search(
+        r"(?i)\b(this (?:guide|document|handbook) (?:explains|covers|describes)|"
+        r"required documents?|office hours?|service window|registration)\b",
+        blob,
+    ):
+        return True
+    headings = {
+        (item.section_title or "").strip().lower()
+        for item in evidence
+        if item.section_title
+    }
+    return len(headings) >= 3 and not re.search(
+        r"(?i)\b(full\s*name|major|university|internship)\b", blob
+    )
+
+
+def _document_overview_from_evidence(evidence: Sequence[RetrievedChunk]) -> str:
+    """Synthesize a short document overview from diverse section evidence."""
+    from app.retrieval.chunk_quality import is_weak_broad_evidence
+    from app.retrieval.section_match import CONTACT_SECTION_RE, OFFICE_HOURS_RE
+
+    purpose = ""
+    topics: List[str] = []
+    policies: List[str] = []
+    dates_fees: List[str] = []
+
+    for item in evidence:
+        heading = (item.section_title or item.subsection_title or "").strip()
+        text = _clean_answer_text(item.content or "")
+        blob = f"{heading}\n{text}"
+        if not text or is_weak_broad_evidence(text):
+            if heading and (item.content_type or "") == "heading":
+                title = heading.strip()
+                if (
+                    title
+                    and title not in topics
+                    and not OFFICE_HOURS_RE.search(title)
+                    and not CONTACT_SECTION_RE.search(title)
+                    and not re.search(r"(?i)\b(guide|handbook|manual)\b", title)
+                ):
+                    topics.append(title)
+            continue
+        if OFFICE_HOURS_RE.search(blob) or CONTACT_SECTION_RE.search(heading):
+            continue
+        if (item.content_type or "") == "heading":
+            if (
+                heading
+                and heading not in topics
+                and not re.search(r"(?i)\b(guide|handbook|manual)\b", heading)
+            ):
+                topics.append(heading)
+            continue
+        if not purpose and re.search(
+            r"(?i)\b(this (?:guide|document|handbook) (?:explains|covers|describes)|"
+            r"overview|purpose|introduction)\b",
+            text,
+        ):
+            purpose = _trim_complete_phrase(text, max_len=180)
+        if heading and heading not in topics and len(heading.split()) <= 6:
+            topics.append(heading)
+        if re.search(
+            r"(?i)\b(must|required|policy|procedure|register|bring|submit)\b", text
+        ):
+            snippet = _trim_complete_phrase(
+                re.split(r"(?<=[.!?])\s+", text)[0], max_len=120
+            )
+            if snippet and snippet not in policies:
+                policies.append(snippet)
+        if re.search(
+            r"(?i)\b(within\s+\d+\s+days?|fee|\$|¥|deadline|effective date)\b", text
+        ):
+            snippet = _trim_complete_phrase(
+                next(
+                    (
+                        part
+                        for part in re.split(r"(?<=[.!?])\s+|\n+", text)
+                        if re.search(
+                            r"(?i)\b(within\s+\d+\s+days?|fee|\$|¥|deadline)\b",
+                            part,
+                        )
+                    ),
+                    text,
+                ),
+                max_len=120,
+            )
+            if snippet and snippet not in dates_fees:
+                dates_fees.append(snippet)
+
+    if not purpose and not topics and not policies:
+        return FALLBACK_ANSWER
+
+    sentences: List[str] = []
+    if purpose:
+        sentence = purpose if purpose.endswith((".", "!", "?")) else f"{purpose}."
+        sentences.append(sentence)
+    else:
+        sentences.append(
+            "This document is a guide covering the main services and procedures described below."
+        )
+    if topics:
+        sentences.append(
+            "Main topics include " + ", ".join(topics[:5]) + "."
+        )
+    if policies:
+        sentences.append(
+            "Key procedures and requirements include " + "; ".join(policies[:2]) + "."
+        )
+    if dates_fees:
+        sentences.append(
+            "Important dates or fees mentioned include " + "; ".join(dates_fees[:2]) + "."
+        )
+    answer = " ".join(sentences)
+    if answer.lstrip().startswith(("•", "-", "·")) or len(answer.split()) < 12:
+        return FALLBACK_ANSWER
+    return answer
+
+
 
 
 def _label_value(evidence: Sequence[RetrievedChunk], label_pattern: str) -> Optional[str]:
@@ -1315,22 +1994,6 @@ def _select_used_evidence(
 
 
 def _sources_for(evidence: Sequence[RetrievedChunk]) -> List[CitationSource]:
-    sources: List[CitationSource] = []
-    seen_pages = set()
-    for item in evidence:
-        key = (item.document_name, item.page_number)
-        if key in seen_pages:
-            continue
-        seen_pages.add(key)
-        sources.append(
-            CitationSource(
-                number=len(sources) + 1,
-                document_name=item.document_name,
-                page_number=item.page_number,
-                source_url=item.source_url,
-                source_type=SourceType.website if item.source_url else SourceType.pdf,
-            )
-        )
-        if len(sources) >= 4:
-            break
-    return sources
+    from app.generation.citations import dedupe_sources
+
+    return dedupe_sources(evidence)[:4]

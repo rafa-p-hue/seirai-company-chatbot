@@ -175,6 +175,7 @@ def test_pet_policy(client: TestClient):
 def test_volunteer_schedule(client: TestClient):
     _upload(client, "harbor-vol")
     body = _chat(client, "When is volunteer orientation and when are shifts?", "harbor-vol")
+    print("VOLUNTEER BODY:", body)
     answer = body["answer"].lower()
     assert "could not find" not in answer
     assert "orientation" in answer or "90" in answer or "saturday" in answer

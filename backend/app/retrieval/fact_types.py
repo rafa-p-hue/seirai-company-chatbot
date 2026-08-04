@@ -53,9 +53,10 @@ EXECUTIVE_RE = re.compile(
 LOCATION_SIGNAL_RE = re.compile(
     r"\b("
     r"located in|based in|headquartered|address|hometown|"
-    r"lives? in|resides?(?:\s+in)?|city|state|country|region"
+    r"lives? in|resides?(?:\s+in)?|city|state|country|region|"
+    r"office|offices|branch|branches|headquarters|head\s*office|\bhq\b"
     r")\b|"
-    r"\b(?:city|state|country|location|address|hometown)\s*:|"
+    r"\b(?:city|state|country|location|address|hometown|other\s+offices)\s*:|"
     r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?,\s*[A-Z]{2}\b",
     re.I,
 )
@@ -97,6 +98,16 @@ FACT_TYPE_PATTERNS = {
 def detect_fact_type(question: str, query_type: str) -> str:
     """Map a question to a strict fact type used for evidence gating."""
     lower = (question or "").lower()
+    from app.generation.evidence_validation import is_checklist_question
+
+    if query_type == "checklist" or is_checklist_question(lower):
+        return "checklist"
+    if query_type == "procedure" or re.search(
+        r"\b(how\s+do\s+i\s+(?:throw\s+away|dispose|discard|apply)|"
+        r"what\s+steps?\s+|disposal\s+(?:steps?|procedure))\b",
+        lower,
+    ):
+        return "procedure"
     if re.search(
         r"\b(what (?:group|organization|club).+(?:found|establish)|"
         r"(?:group|organization|club).+(?:found|establish)|"
@@ -119,7 +130,8 @@ def detect_fact_type(question: str, query_type: str) -> str:
     ):
         return "instrument"
     if query_type == "location" or re.search(
-        r"\b(what state|which state|where .+ located|school located|hometown)\b",
+        r"\b(what state|which state|where .+ located|school located|hometown|"
+        r"office\s+in|have\s+an?\s+office|offices?\s+in|branch\s+in)\b",
         lower,
     ):
         return "location"
@@ -131,6 +143,8 @@ def detect_fact_type(question: str, query_type: str) -> str:
         "accessibility",
     }:
         return query_type
+    if re.search(r"\b(capacity|how many|quantity)\b", lower):
+        return "quantity"
     from app.retrieval.numeric_facts import detect_numeric_fact_type
 
     numeric = detect_numeric_fact_type(lower)
@@ -201,20 +215,94 @@ def evidence_matches_fact_type(content: str, fact_type: str, chunk: RetrievedChu
             or (chunk is not None and chunk.record_type == "research")
         )
     if fact_type == "location":
+        from app.retrieval.answer_grounding import is_contact_details_only
         from app.retrieval.numeric_facts import (
             content_has_address_or_place,
             content_states_unannounced,
         )
 
+        if content_states_unannounced(text):
+            return True
+        # Generic contact rows are not location/office evidence.
+        if is_contact_details_only(text):
+            return False
         return bool(
             LOCATION_SIGNAL_RE.search(text)
             or content_has_address_or_place(text)
-            or content_states_unannounced(text)
         )
     if fact_type == "price":
         from app.retrieval.numeric_facts import content_has_currency
 
         return content_has_currency(text)
+    if fact_type == "checklist":
+        from app.generation.evidence_validation import (
+            REQUIRED_CONTEXT_RE,
+            extract_required_items,
+        )
+        from app.retrieval.checklist_assembly import is_requirement_sibling_payload
+
+        # Prefer extractable checklist items from any content type (lists or
+        # fused procedural prose). Do not hard-filter on content_type alone.
+        if chunk is not None:
+            if extract_required_items([chunk]):
+                return True
+            blob = "\n".join(
+                part
+                for part in (
+                    text,
+                    getattr(chunk, "section_title", None) or "",
+                    getattr(chunk, "subsection_title", None) or "",
+                )
+                if part
+            )
+            if REQUIRED_CONTEXT_RE.search(blob):
+                return True
+            # Trailing same-section bullets often omit "bring/required" wording
+            # but still complete the checklist (certificate, household docs).
+            payload = {
+                "content": text,
+                "section_title": getattr(chunk, "section_title", None),
+                "subsection_title": getattr(chunk, "subsection_title", None),
+                "content_type": getattr(chunk, "content_type", None),
+            }
+            return is_requirement_sibling_payload(payload)
+        return bool(REQUIRED_CONTEXT_RE.search(text))
+    if fact_type == "procedure":
+        blob = text
+        if chunk is not None:
+            blob = "\n".join(
+                part
+                for part in (
+                    text,
+                    getattr(chunk, "section_title", None) or "",
+                    getattr(chunk, "subsection_title", None) or "",
+                )
+                if part
+            )
+        # Prefer ordered procedural language over unrelated fee tables.
+        if re.search(
+            r"(?i)\b("
+            r"step\s*\d|first|then|next|finally|"
+            r"reserve|reservation|sticker|attach|"
+            r"classified\s+as|oversized|throw\s+away|dispose|"
+            r"place\s+(?:the\s+)?(?:item|bags?)|by\s+\d{1,2}:\d{2}"
+            r")\b",
+            blob,
+        ):
+            return True
+        ctype = str(getattr(chunk, "content_type", "") or "") if chunk else ""
+        if ctype in {"list", "numbered_list"}:
+            return True
+        # Explicitly reject bare certificate fee rows for procedural questions.
+        if re.search(
+            r"(?i)\b(residence\s+certificate|family\s+register|counter\s+fee|"
+            r"kiosk\s+fee|fee\s+schedule)\b",
+            blob,
+        ) and not re.search(
+            r"(?i)\b(sticker|oversized|dispose|garbage|waste|reserve)\b", blob
+        ):
+            return False
+        return False
     if fact_type == "quantity":
         from app.retrieval.numeric_facts import content_has_quantity
 
@@ -227,12 +315,34 @@ def evidence_matches_fact_type(content: str, fact_type: str, chunk: RetrievedChu
 
         return content_has_date_or_period(text) or content_states_unannounced(text)
     if fact_type == "policy":
+        from app.retrieval.answer_grounding import is_candidate_fee_evidence
         from app.retrieval.numeric_facts import content_has_policy_rule
 
-        return content_has_policy_rule(text) or bool(
+        blob = text
+        if chunk is not None:
+            parts = [text]
+            if chunk.section_title:
+                parts.append(str(chunk.section_title))
+            if chunk.subsection_title:
+                parts.append(str(chunk.subsection_title))
+            blob = "\n".join(parts)
+        if is_candidate_fee_evidence(blob):
+            return True
+        # Bare heading-only chunks are metadata anchors, not policy answers.
+        if chunk is not None and str(chunk.content_type or "") == "heading":
+            if len((text or "").split()) <= 6:
+                return False
+        return content_has_policy_rule(blob) or bool(
             re.search(
-                r"(?i)\b(membership|volunteer|compost|refund|cancel|rental|pet)\b",
-                text,
+                r"(?i)\b("
+                r"membership|volunteer|compost|refund|cancel|rental|pets?|"
+                r"leave|pto|vacation|time\s+off|remote\s+work|handbook|"
+                r"employees?\s+(?:receive|may|must|shall)|days?\s+of\s+|"
+                r"accepts?|allows?|shelter|evacuat(?:ion|e)|capacity|"
+                r"pet[- ]friendly|patient\s+share|co-?payment|insured\s+treatment|"
+                r"\d+\s*%|percent(?:age)?|free\s+for\s+candidates?|no\s+fee"
+                r")\b",
+                blob,
             )
         )
     if fact_type == "accessibility":
@@ -319,6 +429,8 @@ def filter_evidence_for_fact(
         "date",
         "policy",
         "accessibility",
+        "checklist",
+        "procedure",
     }
     if fact_type in strict_types:
         matched = [
@@ -326,6 +438,62 @@ def filter_evidence_for_fact(
             for item in evidence
             if evidence_matches_fact_type(item.content, fact_type, item)
         ]
+        if fact_type == "price" and question:
+            from app.retrieval.answer_grounding import filter_evidence_for_answer_grounding
+            from app.retrieval.entity_validation import (
+                collect_named_service_fee_evidence,
+                evidence_matches_requested_entity,
+                extract_requested_service_phrases,
+            )
+
+            entity_matched = [
+                item
+                for item in matched
+                if evidence_matches_requested_entity(
+                    item.content or "",
+                    question,
+                    section_title=item.section_title or "",
+                    document_name=item.document_name or "",
+                )
+            ]
+
+            # Service labels and fee amounts can be split across adjacent chunks.
+            # Assemble the complete fee block before document-version selection.
+            if extract_requested_service_phrases(question):
+                block = collect_named_service_fee_evidence(evidence, question)
+
+                candidates = []
+                seen = set()
+                for item in [*entity_matched, *block]:
+                    key = (
+                        item.document_name,
+                        item.chunk_id or "",
+                        item.chunk_index,
+                        (item.content or "")[:120],
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(item)
+
+                if candidates:
+                    grounded, _ = filter_evidence_for_answer_grounding(
+                        candidates, question, fact_type=fact_type
+                    )
+                    return grounded
+                return []
+
+            grounded, _ = filter_evidence_for_answer_grounding(
+                matched, question, fact_type=fact_type
+            )
+            return grounded
+        if fact_type in {"location", "policy"} and question:
+            from app.retrieval.answer_grounding import filter_evidence_for_answer_grounding
+
+            grounded, _ = filter_evidence_for_answer_grounding(
+                matched, question, fact_type=fact_type
+            )
+            return grounded
         return matched
     # Drop bare contact/identity KV dumps unless the question asks for them.
     q = (question or "").lower()
@@ -353,6 +521,8 @@ def answer_matches_fact_type(
     answer: str,
     fact_type: str,
     evidence: Sequence[RetrievedChunk],
+    *,
+    question: str | None = None,
 ) -> bool:
     """Reject answers that don't contain supported evidence of the requested type."""
     if not answer or "could not find that information" in answer.lower():
@@ -385,6 +555,8 @@ def answer_matches_fact_type(
         "date",
         "policy",
         "accessibility",
+        "checklist",
+        "procedure",
     }:
         if UNRELATED_IDENTITY_RE.match(answer.strip()):
             return False
@@ -393,10 +565,31 @@ def answer_matches_fact_type(
 
     if fact_type == "price":
         from app.retrieval.numeric_facts import content_has_currency
+        from app.retrieval.entity_validation import answer_matches_requested_entity
 
-        return content_has_currency(answer) or any(
-            content_has_currency(e.content) for e in evidence
+        if not content_has_currency(answer):
+            return False
+        # When the question names a specific service, the answer must too.
+        if question:
+            return answer_matches_requested_entity(answer, question)
+        return True
+    if fact_type == "procedure":
+        return bool(
+            re.search(
+                r"(?i)\b("
+                r"step|reserve|sticker|attach|classified|dispose|oversized|"
+                r"phone|online|place|week"
+                r")\b",
+                answer or "",
+            )
+        ) or any(
+            evidence_matches_fact_type(item.content, "procedure", item)
+            for item in evidence
         )
+    if fact_type == "checklist":
+        from app.generation.evidence_validation import checklist_answer_is_complete
+
+        return checklist_answer_is_complete(answer, evidence)
     if fact_type == "quantity":
         from app.retrieval.numeric_facts import content_has_quantity
 
@@ -406,16 +599,18 @@ def answer_matches_fact_type(
     if fact_type == "date":
         from app.retrieval.numeric_facts import (
             content_has_date_or_period,
+            content_has_deadline,
             content_states_unannounced,
         )
 
-        return (
-            content_has_date_or_period(answer)
+        # The answer itself must carry the temporal fact — never accept a bare
+        # title/heading because some other evidence chunk happened to contain a date.
+        if _looks_like_heading_only_answer(answer):
+            return False
+        return bool(
+            content_has_deadline(answer)
+            or content_has_date_or_period(answer)
             or content_states_unannounced(answer)
-            or any(
-                content_has_date_or_period(e.content) or content_states_unannounced(e.content)
-                for e in evidence
-            )
         )
     if fact_type == "policy":
         from app.retrieval.numeric_facts import content_has_policy_rule
@@ -493,6 +688,27 @@ def answer_matches_fact_type(
     if fact_type == "leadership":
         return bool(LEADERSHIP_TITLE_RE.search(answer))
     return not bool(UNRELATED_IDENTITY_RE.match(answer.strip()))
+
+
+def _looks_like_heading_only_answer(answer: str) -> bool:
+    text = re.sub(r"\s+", " ", (answer or "").strip())
+    if not text:
+        return True
+    # Strip trailing citation markers for the shape check.
+    text = re.sub(r"(?:\s*\[\d+\])+\s*$", "", text).strip()
+    words = text.split()
+    if len(words) <= 8 and not re.search(r"[.!?]", text):
+        if not re.search(
+            r"(?i)\b(within|before|after|days?|weeks?|months?|deadline|due)\b",
+            text,
+        ):
+            return True
+    if re.fullmatch(
+        r"(?i)[A-Z][A-Za-z0-9 /&-]{2,80}",
+        text,
+    ) and not re.search(r"(?i)\b(within|must|days?)\b", text):
+        return True
+    return False
 
 
 def _value_from_evidence(evidence: Sequence[RetrievedChunk], families: Sequence[str]) -> Optional[str]:

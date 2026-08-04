@@ -14,8 +14,19 @@ import numpy as np
 
 from app.models.api import DocumentChunk, DocumentSummary, SourceType
 from app.vector_store.base import VectorStore
+from app.vector_store.payloads import chunk_from_payload, chunk_to_payload
+from app.vector_store.scope import (
+    dedup_key,
+    normalize_document_scope,
+    payload_dedup_key,
+    payload_in_scope,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _chunk_from_payload(payload: Dict[str, Any], *, company_id: str, document_id: str) -> DocumentChunk:
+    return chunk_from_payload(payload, company_id=company_id, document_id=document_id)
 
 
 class InMemoryVectorStore(VectorStore):
@@ -46,10 +57,8 @@ class InMemoryVectorStore(VectorStore):
         if self._dimension is None and vectors:
             await self.ensure_collection(len(vectors[0]))
 
-        # Skip exact content-hash duplicates for the same company/document.
         existing_hashes = {
-            (point["payload"]["company_id"], point["payload"]["content_hash"])
-            for point in self._points.values()
+            payload_dedup_key(point["payload"]) for point in self._points.values()
         }
         written = 0
         for chunk, vector in zip(chunks, vectors):
@@ -58,36 +67,17 @@ class InMemoryVectorStore(VectorStore):
                     f"Vector dimension mismatch for chunk {chunk.chunk_id}: "
                     f"expected {self._dimension}, got {len(vector)}"
                 )
-            key = (chunk.company_id, chunk.content_hash)
+            key = dedup_key(
+                chunk.company_id,
+                chunk.content_hash,
+                document_scope=chunk.document_scope,
+                session_id=chunk.session_id,
+            )
             if key in existing_hashes and chunk.chunk_id not in self._points:
                 continue
             self._points[chunk.chunk_id] = {
                 "vector": np.asarray(vector, dtype=np.float32),
-                "payload": {
-                    "chunk_id": chunk.chunk_id,
-                    "company_id": chunk.company_id,
-                    "document_id": chunk.document_id,
-                    "document_name": chunk.document_name,
-                    "page_number": chunk.page_number,
-                    "section_title": chunk.section_title,
-                    "subsection_title": chunk.subsection_title,
-                    "chunk_index": chunk.chunk_index,
-                    "content": chunk.content,
-                    "content_hash": chunk.content_hash,
-                    "source_type": chunk.source_type.value,
-                    "source_url": chunk.source_url,
-                    "uploaded_at": chunk.uploaded_at.isoformat(),
-                    "record_id": chunk.record_id,
-                    "record_type": chunk.record_type,
-                    "person_name": chunk.person_name,
-                    "title": chunk.title,
-                    "organization": chunk.organization,
-                    "dates": chunk.dates,
-                    "location": chunk.location,
-                    "content_type": chunk.content_type,
-                    "label": chunk.label,
-                    "value": chunk.value,
-                },
+                "payload": chunk_to_payload(chunk),
             }
             existing_hashes.add(key)
             written += 1
@@ -99,13 +89,22 @@ class InMemoryVectorStore(VectorStore):
         company_id: str,
         query_vector: Sequence[float],
         top_k: int,
+        session_id: Optional[str] = None,
+        include_company_docs: bool = True,
+        document_scope: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         query = np.asarray(query_vector, dtype=np.float32)
         q_norm = float(np.linalg.norm(query)) or 1.0
         scored: List[Dict[str, Any]] = []
         for point in self._points.values():
             payload = point["payload"]
-            if payload["company_id"] != company_id:
+            if not payload_in_scope(
+                payload,
+                company_id=company_id,
+                session_id=session_id,
+                include_company_docs=include_company_docs,
+                document_scope=document_scope,
+            ):
                 continue
             vector = point["vector"]
             v_norm = float(np.linalg.norm(vector)) or 1.0
@@ -114,15 +113,29 @@ class InMemoryVectorStore(VectorStore):
         scored.sort(key=lambda item: item["score"], reverse=True)
         return scored[:top_k]
 
-    async def list_documents(self, company_id: str) -> List[DocumentSummary]:
+    async def list_documents(
+        self,
+        company_id: str,
+        *,
+        session_id: Optional[str] = None,
+        document_scope: Optional[str] = "company",
+        include_company_docs: bool = True,
+    ) -> List[DocumentSummary]:
         documents: Dict[str, DocumentSummary] = {}
         for point in self._points.values():
             payload = point["payload"]
-            if payload["company_id"] != company_id:
+            if not payload_in_scope(
+                payload,
+                company_id=company_id,
+                session_id=session_id,
+                include_company_docs=include_company_docs,
+                document_scope=document_scope,
+            ):
                 continue
             document_id = str(payload["document_id"])
             if document_id not in documents:
                 uploaded = payload.get("uploaded_at")
+                scope = normalize_document_scope(payload.get("document_scope"))
                 documents[document_id] = DocumentSummary(
                     document_id=document_id,
                     company_id=company_id,
@@ -140,6 +153,8 @@ class InMemoryVectorStore(VectorStore):
                     universal_chunk_count=0,
                     structured_chunk_count=0,
                     document_headings=[],
+                    document_scope=scope,  # type: ignore[arg-type]
+                    session_id=payload.get("session_id") if scope == "chat" else None,
                 )
             summary = documents[document_id]
             summary.chunk_count += 1
@@ -183,41 +198,27 @@ class InMemoryVectorStore(VectorStore):
                 or payload["document_id"] != document_id
             ):
                 continue
-            uploaded = payload.get("uploaded_at")
             chunks.append(
-                DocumentChunk(
-                    chunk_id=str(payload.get("chunk_id")),
-                    company_id=company_id,
-                    document_id=document_id,
-                    document_name=str(payload.get("document_name")),
-                    page_number=payload.get("page_number"),
-                    section_title=payload.get("section_title"),
-                    subsection_title=payload.get("subsection_title"),
-                    chunk_index=int(payload.get("chunk_index") or 0),
-                    content=str(payload.get("content") or ""),
-                    content_hash=str(payload.get("content_hash") or ""),
-                    source_type=SourceType(payload.get("source_type") or "pdf"),
-                    source_url=payload.get("source_url"),
-                    uploaded_at=datetime.fromisoformat(uploaded)
-                    if uploaded
-                    else datetime.utcnow(),
-                    record_id=payload.get("record_id"),
-                    record_type=payload.get("record_type"),
-                    person_name=payload.get("person_name"),
-                    title=payload.get("title"),
-                    organization=payload.get("organization"),
-                    dates=payload.get("dates"),
-                    location=payload.get("location"),
-                    content_type=payload.get("content_type"),
-                    label=payload.get("label"),
-                    value=payload.get("value"),
-                )
+                _chunk_from_payload(payload, company_id=company_id, document_id=document_id)
             )
         return sorted(chunks, key=lambda chunk: chunk.chunk_index)
 
-    async def list_payloads(self, company_id: str) -> List[Dict[str, Any]]:
+    async def list_payloads(
+        self,
+        company_id: str,
+        *,
+        session_id: Optional[str] = None,
+        include_company_docs: bool = True,
+        document_scope: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         return [
             point["payload"]
             for point in self._points.values()
-            if point["payload"]["company_id"] == company_id
+            if payload_in_scope(
+                point["payload"],
+                company_id=company_id,
+                session_id=session_id,
+                include_company_docs=include_company_docs,
+                document_scope=document_scope,
+            )
         ]

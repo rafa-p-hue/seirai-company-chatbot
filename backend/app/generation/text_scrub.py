@@ -21,18 +21,16 @@ def scrub_internal_metadata(text: str) -> str:
     if not text:
         return ""
     # Normalize common labeled scaffolding even when flattened onto one line.
-    text = re.sub(
-        r"(?i)\brecord\s*type\s*:\s*\S+",
-        " ",
-        text,
-    )
+    text = re.sub(r"(?i)\brecord\s*type\s*:\s*\S+", " ", text)
     text = re.sub(r"(?i)\bprofile\s*description\s*:\s*", " ", text)
-    text = re.sub(r"(?i)\bperson\s*:\s*", " ", text)
-    text = re.sub(r"(?i)\bsection\s*:\s*", " ", text)
-    text = re.sub(r"(?i)\bdescription\s*:\s*", " ", text)
+    text = re.sub(r"(?i)\binternal\s*score\s*:\s*\S+", " ", text)
+    text = re.sub(r"(?i)\bretrieval\s*category\s*:\s*\S+", " ", text)
     lines: List[str] = []
     for raw in text.splitlines():
         line = raw.strip()
+        if not line:
+            continue
+        line = BRACKET_HEADING_RE.sub("", line).strip()
         if not line:
             continue
         if INTERNAL_LINE_RE.match(line):
@@ -45,6 +43,11 @@ def scrub_internal_metadata(text: str) -> str:
             if re.match(r"(?i)^record\s*type\b", raw.strip()):
                 continue
             lines.append(value)
+            continue
+        # Keep Person:/Organization: values when they are the whole line.
+        person_match = re.match(r"(?i)^person\s*:\s*(.+)$", line)
+        if person_match:
+            lines.append(person_match.group(1).strip())
             continue
         line = INTERNAL_INLINE_RE.sub("", line).strip(" ;|")
         if line:
@@ -64,5 +67,7 @@ def looks_like_internal_metadata(text: str) -> bool:
     if re.match(r"(?i)^person\s*:", stripped) and len(stripped) < 80:
         return True
     if re.match(r"(?i)^profile\s*description\s*:", stripped):
+        return True
+    if re.match(r"(?i)^(internal\s*score|retrieval\s*category)\s*:", stripped):
         return True
     return False

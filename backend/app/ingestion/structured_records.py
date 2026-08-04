@@ -334,22 +334,23 @@ def parse_structured_records(
 
 
 def _profile_description(person_name: str, records: Sequence[StructuredRecord]) -> str:
-    parts = [f"Name: {person_name}"]
+    """Clean profile summary without internal label scaffolding."""
+    parts = [person_name] if person_name else []
     for record in records:
         if record.record_type == "education":
-            bit = "Education: "
-            bit += ", ".join(
+            bit = ", ".join(
                 part
                 for part in [record.organization, record.title, record.dates]
                 if part
             )
-            parts.append(bit)
+            if bit:
+                parts.append(bit)
         if record.record_type in {"experience", "internship"} and record.title:
             role = record.title
             if record.organization:
                 role += f" at {record.organization}"
-            parts.append(f"Experience: {role}")
-            if len([p for p in parts if p.startswith("Experience")]) >= 2:
+            parts.append(role)
+            if len([p for p in parts if p != person_name]) >= 3:
                 break
     return "\n".join(parts)
 

@@ -101,12 +101,11 @@ def resolve_subject_name(
     document_name: str = "",
 ) -> Optional[str]:
     """Pick a subject for short-query expansion from question/history/entities."""
-    blob = f"{question}\n{history_text}".strip()
-
+    # Prefer the current question only for "who is …" — scanning history caused
+    # fully-specified questions to inherit subjects like "the CEO now".
     match = re.search(
         r"who is\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})\??",
-        blob,
-        re.I,
+        question or "",
     )
     if match:
         return match.group(1).strip()
@@ -118,6 +117,15 @@ def resolve_subject_name(
             return entity
         if first.lower() in q.lower() and len(q.split()) <= 5:
             return entity
+
+    # History may still help short elliptical queries that name nobody.
+    if len(q.split()) <= 5 and history_text:
+        hist_match = re.search(
+            r"who is\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})\??",
+            history_text,
+        )
+        if hist_match and len(q.split()) <= 4:
+            return hist_match.group(1).strip()
 
     if entities:
         return entities[0]

@@ -157,6 +157,7 @@ def broad_quality(content: str, payload: Dict[str, Any] | None = None) -> Tuple[
     if LINK_LABEL_RE.match(raw) and "\n" not in raw:
         return -0.9, "link_label"
     text = strip_leading_form_noise(raw) or raw
+    heading = str((payload or {}).get("section_title") or "")
     if SECTION_PROMPT_RE.match(text) and len(text.split()) < 18:
         return -0.9, "form_instruction"
     if AWARDS_HEADING_RE.match(text) and len(text) < 60:
@@ -164,11 +165,23 @@ def broad_quality(content: str, payload: Dict[str, Any] | None = None) -> Tuple[
     if IDENTITY_ONLY_RE.match(text):
         # Isolated contact/label fields are weak for broad overviews.
         return -0.45, "isolated_contact_or_label"
+    if re.search(
+        r"(?i)\b(office hours?|opening hours?|business hours?|contact information)\b",
+        f"{heading}\n{text}",
+    ):
+        return -0.75, "hours_or_contact_noise"
     if len(text.split()) <= 3:
         return -0.7, "heading_or_fragment"
 
     boost = 0.0
     reason = "paragraph_or_entry"
+    if re.search(
+        r"(?i)\b(this (?:guide|document|handbook) (?:explains|covers|describes)|"
+        r"overview|purpose|introduction)\b",
+        text,
+    ):
+        boost += 0.45
+        reason = "document_purpose"
     if RESPONSIBILITY_RE.search(text) or " – " in text or " — " in text or " - " in text:
         boost += 0.35
         reason = "complete_list_entry"
@@ -183,6 +196,12 @@ def broad_quality(content: str, payload: Dict[str, Any] | None = None) -> Tuple[
         boost += 0.12
     if re.search(r"(?i)\b(music|ensemble|band|performance|chapter|fraternity|organization)\b", text):
         boost += 0.12
+    if re.search(
+        r"(?i)\b(registration|policy|procedure|fees?|services?|requirements?)\b",
+        f"{heading}\n{text}",
+    ):
+        boost += 0.14
+        reason = "major_topic_coverage"
     record_type = str((payload or {}).get("record_type") or "")
     if record_type in {"experience", "internship", "research", "leadership", "education"}:
         boost += 0.08
@@ -198,6 +217,15 @@ def is_weak_broad_evidence(content: str) -> bool:
     ):
         return True
     if IDENTITY_ONLY_RE.match(text):
+        return True
+    if re.search(
+        r"(?i)\b(office hours?|opening hours?|business hours?|"
+        r"monday through friday|saturday and sunday:\s*closed)\b",
+        text,
+    ) and not re.search(
+        r"(?i)\b(this (?:guide|document|handbook)|registration|required documents)\b",
+        text,
+    ):
         return True
     if len(text.split()) <= 3:
         return True

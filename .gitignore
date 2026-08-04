@@ -49,6 +49,8 @@ frontend/tsconfig.tsbuildinfo
 # Uploads / local data
 backend/data/uploads/
 backend/data/cache/
+backend/chat_history.db
+backend/chat_history.db-*
 *.pdf
 !backend/tests/fixtures/*.pdf
 !frontend/public/sample-company.pdf

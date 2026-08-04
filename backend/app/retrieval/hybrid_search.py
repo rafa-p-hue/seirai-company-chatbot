@@ -62,6 +62,60 @@ def phrase_score(question: str, content: str) -> float:
     return 0.0
 
 
+def query_term_scores(question: str, content: str) -> dict[str, float]:
+    """Exact lexical scores for a main term and parenthetical aliases."""
+    normalized = re.sub(r"\s+", " ", question or "").strip()
+    aliases = [
+        re.sub(r"\s+", " ", value).strip(" ?.,")
+        for value in re.findall(r"\(([^()]{2,80})\)", normalized)
+    ]
+    main = re.sub(r"\([^()]*\)", " ", normalized)
+    main = re.sub(
+        r"(?i)^\s*(?:how much (?:does|is)|what (?:is|are) the (?:price|cost|fee) (?:of|for)|"
+        r"how much (?:is|are))\s+",
+        "",
+        main,
+    )
+    # Do not strip mid-question "fee/cost/price" — that destroyed
+    # "What fee does X charge for a permanent placement?" → "What".
+    main = re.sub(
+        r"(?i)\b(?:at the|through the)\b.*$",
+        "",
+        main,
+    ).strip(" ?.,")
+    main = re.sub(
+        r"(?i)\s+(?:cost|costs|fees?|prices?|pricing)\s*$",
+        "",
+        main,
+    ).strip(" ?.,")
+    main = re.sub(r"(?i)^(?:a|an|the)\s+", "", main).strip()
+    # "What fee does Org charge for SERVICE" → keep the SERVICE phrase.
+    charge_for = re.search(
+        r"(?i)\b(?:fee|cost|price)?\s*(?:does|do)\s+.+\s+charge\s+for\s+(?:a|an|the)?\s*(.+)$",
+        normalized,
+    )
+    if charge_for:
+        service = charge_for.group(1).strip(" ?.,")
+        if service:
+            main = service
+    main = re.sub(r"(?i)^(?:a|an|the)\s+", "", main).strip()
+    phrases = [phrase for phrase in [main, *aliases] if phrase]
+    scores: dict[str, float] = {}
+    content_l = re.sub(r"\s+", " ", content or "").lower()
+    for phrase in phrases:
+        phrase_l = phrase.lower()
+        if phrase_l in content_l:
+            scores[phrase] = 1.0
+            continue
+        tokens = tokenize(phrase)
+        if not tokens:
+            scores[phrase] = 0.0
+            continue
+        content_tokens = tokenize(content)
+        scores[phrase] = round(len(tokens & content_tokens) / len(tokens), 4)
+    return scores
+
+
 def label_boost(query_type: str, content: str, payload: dict) -> float:
     """Boost labeled fields and headings relevant to the query intent."""
     text = content.lower()
@@ -109,6 +163,15 @@ def label_boost(query_type: str, content: str, payload: dict) -> float:
             "compost",
             "rental",
             "accessibility",
+        ),
+        "checklist": (
+            "required",
+            "requirements",
+            "bring",
+            "documents",
+            "items",
+            "submit",
+            "provide",
         ),
         "price": ("price", "cost", "fee", "membership", "dues", "$"),
         "quantity": ("quantity", "pounds", "tons", "donation", "amount"),

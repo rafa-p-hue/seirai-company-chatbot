@@ -7,28 +7,55 @@ import {
   checkBackendHealth,
   deleteDocument,
   ingestWebsite,
+  listDocumentChunks,
   listDocuments,
   reprocessDocument,
   retrieveEvidence,
-  uploadPdf,
+  uploadDocument,
   type BackendDocument,
   type RetrieveResponse,
+  type StoredChunkView,
   type UploadResponse,
 } from "@/lib/rag-api";
+import {
+  fileTypeLabel,
+  isSupportedUploadFile,
+  SUPPORTED_FORMAT_LABEL,
+  UPLOAD_ACCEPT_EXTENSIONS,
+} from "@/lib/supported-formats";
 
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
+
+type AdminUploadItem = {
+  localId: string;
+  filename: string;
+  fileType: string;
+  status:
+    | "selected"
+    | "uploading"
+    | "parsing"
+    | "chunking"
+    | "embedding"
+    | "ready"
+    | "failed";
+  error?: string;
+  result?: UploadResponse;
+  sourceFile?: File;
+};
 
 export default function AdminPage() {
   const [companyId, setCompanyId] = useState("seirai");
   const [backendReady, setBackendReady] = useState(false);
   const [documents, setDocuments] = useState<BackendDocument[]>([]);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<AdminUploadItem[]>([]);
   const [websiteUrl, setWebsiteUrl] = useState("");
   const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [retrievalQuestion, setRetrievalQuestion] = useState("");
   const [retrieval, setRetrieval] = useState<RetrieveResponse | null>(null);
+  const [storedChunks, setStoredChunks] = useState<StoredChunkView[] | null>(null);
+  const [chunksDocId, setChunksDocId] = useState<string | null>(null);
 
   async function refresh() {
     const healthy = await checkBackendHealth();
@@ -67,26 +94,92 @@ export default function AdminPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [companyId]);
 
+  function queueFiles(fileList: FileList | null) {
+    if (!fileList?.length) return;
+    const next: AdminUploadItem[] = [];
+    const rejected: string[] = [];
+    for (const file of Array.from(fileList)) {
+      if (!isSupportedUploadFile(file)) {
+        rejected.push(file.name);
+        continue;
+      }
+      if (file.size > MAX_FILE_SIZE_BYTES) {
+        rejected.push(`${file.name} (too large)`);
+        continue;
+      }
+      next.push({
+        localId: crypto.randomUUID(),
+        filename: file.name,
+        fileType: fileTypeLabel(file.name, file.type),
+        status: "selected",
+        sourceFile: file,
+      });
+    }
+    setSelectedFiles((current) => [...current, ...next]);
+    setError(
+      rejected.length
+        ? `Skipped unsupported/oversized files. Supported: ${SUPPORTED_FORMAT_LABEL}.`
+        : "",
+    );
+  }
+
+  async function uploadOne(item: AdminUploadItem): Promise<AdminUploadItem> {
+    if (!item.sourceFile) {
+      return { ...item, status: "failed", error: "Original file unavailable." };
+    }
+    const patch = (status: AdminUploadItem["status"]) => {
+      setSelectedFiles((current) =>
+        current.map((row) =>
+          row.localId === item.localId ? { ...row, status, error: undefined } : row,
+        ),
+      );
+    };
+    try {
+      patch("uploading");
+      patch("parsing");
+      patch("chunking");
+      const result = await uploadDocument(companyId, item.sourceFile);
+      patch("embedding");
+      const ready: AdminUploadItem = {
+        ...item,
+        status: "ready",
+        result,
+        sourceFile: undefined,
+      };
+      setSelectedFiles((current) =>
+        current.map((row) => (row.localId === item.localId ? ready : row)),
+      );
+      return ready;
+    } catch (err) {
+      const failed: AdminUploadItem = {
+        ...item,
+        status: "failed",
+        error: err instanceof Error ? err.message : "Upload failed.",
+      };
+      setSelectedFiles((current) =>
+        current.map((row) => (row.localId === item.localId ? failed : row)),
+      );
+      return failed;
+    }
+  }
+
   async function handleUpload(event: FormEvent) {
     event.preventDefault();
     setError("");
     setUploadResult(null);
-    if (!selectedFile) {
-      setError("Choose a PDF file first.");
-      return;
-    }
-    if (selectedFile.size > MAX_FILE_SIZE_BYTES) {
-      setError("PDF must be 10 MB or smaller.");
+    const pending = selectedFiles.filter(
+      (item) => item.status === "selected" || item.status === "failed",
+    );
+    if (pending.length === 0) {
+      setError("Choose one or more supported files first.");
       return;
     }
     setBusy(true);
     try {
-      const result = await uploadPdf(companyId, selectedFile);
-      setUploadResult(result);
-      setSelectedFile(null);
+      const results = await Promise.all(pending.map((item) => uploadOne(item)));
+      const lastReady = [...results].reverse().find((item) => item.status === "ready");
+      if (lastReady?.result) setUploadResult(lastReady.result);
       await refresh();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Upload failed.");
     } finally {
       setBusy(false);
     }
@@ -133,16 +226,24 @@ export default function AdminPage() {
             </p>
             <h1 className="text-3xl font-semibold">Admin Ingestion Console</h1>
             <p className="mt-2 text-sm text-slate-600">
-              Upload PDFs or crawl approved websites into Qdrant via the FastAPI
-              RAG backend.
+              Upload {SUPPORTED_FORMAT_LABEL} files or crawl approved websites
+              into Qdrant via the FastAPI RAG backend.
             </p>
           </div>
-          <Link
-            href={`/embed/seirai?company_id=${encodeURIComponent(companyId)}`}
-            className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white"
-          >
-            Open Chatbot
-          </Link>
+          <div className="flex flex-wrap gap-2">
+            <Link
+              href="/chat"
+              className="rounded-full bg-slate-950 px-4 py-2 text-sm font-semibold text-white"
+            >
+              Open Chat
+            </Link>
+            <Link
+              href={`/embed/seirai?company_id=${encodeURIComponent(companyId)}`}
+              className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700"
+            >
+              Embed widget
+            </Link>
+          </div>
         </header>
 
         <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
@@ -174,10 +275,11 @@ export default function AdminPage() {
             onSubmit={handleUpload}
             className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm"
           >
-            <h2 className="text-xl font-semibold">Upload PDF</h2>
+            <h2 className="text-xl font-semibold">Upload documents</h2>
             <p className="mt-2 text-xs text-slate-500">
-              Choose a text-based PDF (selectable text). Scanned image PDFs are
-              not supported yet. Need a test file?{" "}
+              Select or drag multiple files. Supported: {SUPPORTED_FORMAT_LABEL}.
+              Each file is validated and processed independently. Need a test
+              file?{" "}
               <a
                 href="/sample-company.pdf"
                 className="font-semibold text-cyan-800 underline"
@@ -191,28 +293,67 @@ export default function AdminPage() {
               className="mt-4 flex cursor-pointer flex-col items-start gap-2 rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm hover:border-cyan-700"
             >
               <span className="font-semibold text-slate-800">
-                {selectedFile ? "Change PDF" : "Choose PDF file"}
+                Choose files
               </span>
               <span className="text-xs text-slate-500">
-                {selectedFile
-                  ? `${selectedFile.name} (${Math.round(selectedFile.size / 1024)} KB)`
-                  : "PDF only · max 10 MB"}
+                {SUPPORTED_FORMAT_LABEL} · max 10 MB each
               </span>
               <input
                 id="pdf-upload"
                 type="file"
-                accept="application/pdf,.pdf"
+                multiple
+                accept={UPLOAD_ACCEPT_EXTENSIONS}
                 className="sr-only"
                 onChange={(event) => {
-                  const file = event.target.files?.[0] ?? null;
-                  setSelectedFile(file);
-                  setError("");
+                  queueFiles(event.target.files);
+                  event.target.value = "";
                 }}
               />
             </label>
+            {selectedFiles.length > 0 ? (
+              <ul className="mt-4 grid gap-2">
+                {selectedFiles.map((file) => (
+                  <li
+                    key={file.localId}
+                    className={`rounded-xl border px-3 py-2 text-xs ${
+                      file.status === "failed"
+                        ? "border-amber-200 bg-amber-50"
+                        : "border-slate-200 bg-slate-50"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="truncate font-medium">{file.filename}</p>
+                        <p className="mt-0.5 text-slate-500">
+                          {file.fileType} · {file.status}
+                          {file.error ? ` · ${file.error}` : ""}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        className="shrink-0 text-slate-500 hover:text-slate-800"
+                        onClick={() =>
+                          setSelectedFiles((current) =>
+                            current.filter((row) => row.localId !== file.localId),
+                          )
+                        }
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
             <button
               type="submit"
-              disabled={busy || !selectedFile || !backendReady}
+              disabled={
+                busy ||
+                !backendReady ||
+                !selectedFiles.some(
+                  (item) => item.status === "selected" || item.status === "failed",
+                )
+              }
               className="mt-4 rounded-full bg-cyan-700 px-5 py-3 text-sm font-semibold text-white disabled:bg-slate-300"
             >
               {busy ? "Uploading..." : "Upload & Embed"}
@@ -307,6 +448,24 @@ export default function AdminPage() {
                       type="button"
                       className="rounded-full border border-slate-300 px-3 py-2 text-xs font-semibold"
                       onClick={() =>
+                        void listDocumentChunks(companyId, document.document_id)
+                          .then((data) => {
+                            setChunksDocId(document.document_id);
+                            setStoredChunks(data.chunks);
+                          })
+                          .catch((err) =>
+                            setError(
+                              err instanceof Error ? err.message : "Chunk list failed.",
+                            ),
+                          )
+                      }
+                    >
+                      View chunks
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-full border border-slate-300 px-3 py-2 text-xs font-semibold"
+                      onClick={() =>
                         void reprocessDocument(companyId, document.document_id)
                           .then(refresh)
                           .catch((err) =>
@@ -365,6 +524,10 @@ export default function AdminPage() {
                   {retrieval.original_query || retrievalQuestion}
                 </p>
                 <p className="mt-1">
+                  <span className="font-semibold">Resolved:</span>{" "}
+                  {retrieval.resolved_query || "—"}
+                </p>
+                <p className="mt-1">
                   <span className="font-semibold">Expanded:</span>{" "}
                   {retrieval.expanded_query || "—"}
                 </p>
@@ -379,11 +542,21 @@ export default function AdminPage() {
                   </p>
                 ) : null}
               </div>
+              {retrieval.inspection ? (
+                <details className="rounded-2xl border border-slate-200 bg-white p-3 text-xs">
+                  <summary className="cursor-pointer font-semibold">
+                    Retrieval inspection (dev)
+                  </summary>
+                  <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap text-[11px] text-slate-600">
+                    {JSON.stringify(retrieval.inspection, null, 2)}
+                  </pre>
+                </details>
+              ) : null}
               {retrieval.results.map((item, index) => (
                 <div key={`${item.document_name}-${index}`} className="rounded-2xl bg-slate-50 p-3 text-sm">
                   <p className="text-xs text-slate-500">
-                    score {item.score.toFixed(4)} · {item.record_type || "unknown"} ·{" "}
-                    {item.title || "untitled"}
+                    score {item.score.toFixed(4)} · {item.content_type || item.record_type || "unknown"} ·{" "}
+                    {item.section_title || item.title || "untitled"}
                     {item.organization ? ` @ ${item.organization}` : ""}
                     {item.page_number ? ` · page ${item.page_number}` : ""}
                   </p>
@@ -398,6 +571,43 @@ export default function AdminPage() {
             </div>
           ) : null}
         </section>
+
+        {storedChunks && chunksDocId ? (
+          <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-xl font-semibold">Stored chunks</h2>
+              <button
+                type="button"
+                className="text-xs font-semibold text-slate-500"
+                onClick={() => {
+                  setStoredChunks(null);
+                  setChunksDocId(null);
+                }}
+              >
+                Close
+              </button>
+            </div>
+            <p className="mt-1 text-xs text-slate-500">
+              document {chunksDocId} · {storedChunks.length} chunks
+            </p>
+            <div className="mt-4 max-h-[32rem] space-y-3 overflow-y-auto">
+              {storedChunks.map((chunk) => (
+                <div key={chunk.chunk_id} className="rounded-2xl border border-slate-200 bg-slate-50 p-3">
+                  <p className="text-xs text-slate-500">
+                    {chunk.chunk_id.slice(0, 8)} · #{chunk.chunk_index + 1} · page{" "}
+                    {chunk.page_number ?? "n/a"} · {chunk.content_type || "unknown"} ·{" "}
+                    {chunk.token_count} tokens
+                  </p>
+                  <p className="mt-1 text-xs font-semibold text-slate-700">
+                    {chunk.section_title || "no section"}
+                    {chunk.subsection_title ? ` / ${chunk.subsection_title}` : ""}
+                  </p>
+                  <p className="mt-2 whitespace-pre-wrap text-xs">{chunk.content}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
       </div>
     </main>
   );

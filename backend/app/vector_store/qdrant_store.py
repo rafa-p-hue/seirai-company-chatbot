@@ -10,8 +10,19 @@ from qdrant_client.http import models as qmodels
 from app.config import Settings
 from app.models.api import DocumentChunk, DocumentSummary, SourceType
 from app.vector_store.base import VectorStore
+from app.vector_store.payloads import chunk_from_payload, chunk_to_payload
+from app.vector_store.scope import (
+    dedup_key,
+    normalize_document_scope,
+    payload_dedup_key,
+    payload_in_scope,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _chunk_from_payload(payload: Dict[str, Any], *, company_id: str, document_id: str) -> DocumentChunk:
+    return chunk_from_payload(payload, company_id=company_id, document_id=document_id)
 
 
 class QdrantVectorStore(VectorStore):
@@ -36,6 +47,7 @@ class QdrantVectorStore(VectorStore):
                     f"Qdrant collection '{self.collection}' expects dimension {existing}, "
                     f"but embeddings are {dimension}."
                 )
+            self._ensure_scope_indexes()
             return
 
         logger.info("Creating Qdrant collection %s (dim=%s)", self.collection, dimension)
@@ -46,21 +58,30 @@ class QdrantVectorStore(VectorStore):
                 distance=qmodels.Distance.COSINE,
             ),
         )
-        self.client.create_payload_index(
-            collection_name=self.collection,
-            field_name="company_id",
-            field_schema=qmodels.PayloadSchemaType.KEYWORD,
-        )
-        self.client.create_payload_index(
-            collection_name=self.collection,
-            field_name="document_id",
-            field_schema=qmodels.PayloadSchemaType.KEYWORD,
-        )
-        self.client.create_payload_index(
-            collection_name=self.collection,
-            field_name="content_hash",
-            field_schema=qmodels.PayloadSchemaType.KEYWORD,
-        )
+        for field_name in (
+            "company_id",
+            "document_id",
+            "content_hash",
+            "document_scope",
+            "session_id",
+        ):
+            self.client.create_payload_index(
+                collection_name=self.collection,
+                field_name=field_name,
+                field_schema=qmodels.PayloadSchemaType.KEYWORD,
+            )
+
+    def _ensure_scope_indexes(self) -> None:
+        for field_name in ("document_scope", "session_id"):
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.collection,
+                    field_name=field_name,
+                    field_schema=qmodels.PayloadSchemaType.KEYWORD,
+                )
+            except Exception:  # noqa: BLE001
+                # Index may already exist on older collections.
+                logger.debug("Payload index %s may already exist", field_name)
 
     async def upsert_chunks(
         self,
@@ -72,7 +93,6 @@ class QdrantVectorStore(VectorStore):
         if self._dimension is None and vectors:
             await self.ensure_collection(len(vectors[0]))
 
-        # Skip chunks whose content_hash already exists for this company.
         existing_hashes = self._existing_content_hashes(
             {chunk.company_id for chunk in chunks}
         )
@@ -84,45 +104,29 @@ class QdrantVectorStore(VectorStore):
                     f"Vector dimension mismatch for chunk {chunk.chunk_id}: "
                     f"expected {self._dimension}, got {len(vector)}"
                 )
-            if (chunk.company_id, chunk.content_hash) in existing_hashes:
+            key = dedup_key(
+                chunk.company_id,
+                chunk.content_hash,
+                document_scope=chunk.document_scope,
+                session_id=chunk.session_id,
+            )
+            if key in existing_hashes:
                 logger.info(
-                    "Skipping duplicate chunk hash %s for company %s",
+                    "Skipping duplicate chunk hash %s for company %s scope=%s session=%s",
                     chunk.content_hash[:12],
                     chunk.company_id,
+                    chunk.document_scope,
+                    chunk.session_id,
                 )
                 continue
             points.append(
                 qmodels.PointStruct(
                     id=self._point_id(chunk.chunk_id),
                     vector=list(vector),
-                    payload={
-                        "chunk_id": chunk.chunk_id,
-                        "company_id": chunk.company_id,
-                        "document_id": chunk.document_id,
-                        "document_name": chunk.document_name,
-                        "page_number": chunk.page_number,
-                        "section_title": chunk.section_title,
-                        "subsection_title": chunk.subsection_title,
-                        "chunk_index": chunk.chunk_index,
-                        "content": chunk.content,
-                        "content_hash": chunk.content_hash,
-                        "source_type": chunk.source_type.value,
-                        "source_url": chunk.source_url,
-                        "uploaded_at": chunk.uploaded_at.isoformat(),
-                        "record_id": chunk.record_id,
-                        "record_type": chunk.record_type,
-                        "person_name": chunk.person_name,
-                        "title": chunk.title,
-                        "organization": chunk.organization,
-                        "dates": chunk.dates,
-                        "location": chunk.location,
-                        "content_type": chunk.content_type,
-                        "label": chunk.label,
-                        "value": chunk.value,
-                    },
+                    payload=chunk_to_payload(chunk),
                 )
             )
-            existing_hashes.add((chunk.company_id, chunk.content_hash))
+            existing_hashes.add(key)
 
         if not points:
             return 0
@@ -147,20 +151,31 @@ class QdrantVectorStore(VectorStore):
                     ),
                     limit=256,
                     offset=offset,
-                    with_payload=["company_id", "content_hash"],
+                    with_payload=[
+                        "company_id",
+                        "content_hash",
+                        "document_scope",
+                        "session_id",
+                    ],
                     with_vectors=False,
                 )
                 for point in points:
                     payload = point.payload or {}
-                    hashes.add(
-                        (
-                            str(payload.get("company_id")),
-                            str(payload.get("content_hash")),
-                        )
-                    )
+                    hashes.add(payload_dedup_key(payload))
                 if offset is None:
                     break
         return hashes
+
+    @staticmethod
+    def _company_filter(company_id: str) -> qmodels.Filter:
+        return qmodels.Filter(
+            must=[
+                qmodels.FieldCondition(
+                    key="company_id",
+                    match=qmodels.MatchValue(value=company_id),
+                )
+            ]
+        )
 
     async def search(
         self,
@@ -168,46 +183,50 @@ class QdrantVectorStore(VectorStore):
         company_id: str,
         query_vector: Sequence[float],
         top_k: int,
+        session_id: Optional[str] = None,
+        include_company_docs: bool = True,
+        document_scope: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        # Over-fetch then apply scope filter so legacy payloads without
+        # document_scope still resolve as company-scoped.
+        fetch_k = max(top_k * 4, top_k, 32)
         results = self.client.search(
             collection_name=self.collection,
             query_vector=list(query_vector),
-            limit=top_k,
-            query_filter=qmodels.Filter(
-                must=[
-                    qmodels.FieldCondition(
-                        key="company_id",
-                        match=qmodels.MatchValue(value=company_id),
-                    )
-                ]
-            ),
+            limit=fetch_k,
+            query_filter=self._company_filter(company_id),
             with_payload=True,
         )
         output: List[Dict[str, Any]] = []
         for point in results:
             payload = point.payload or {}
-            output.append(
-                {
-                    "score": float(point.score),
-                    "payload": payload,
-                }
-            )
+            if not payload_in_scope(
+                payload,
+                company_id=company_id,
+                session_id=session_id,
+                include_company_docs=include_company_docs,
+                document_scope=document_scope,
+            ):
+                continue
+            output.append({"score": float(point.score), "payload": payload})
+            if len(output) >= top_k:
+                break
         return output
 
-    async def list_documents(self, company_id: str) -> List[DocumentSummary]:
+    async def list_documents(
+        self,
+        company_id: str,
+        *,
+        session_id: Optional[str] = None,
+        document_scope: Optional[str] = "company",
+        include_company_docs: bool = True,
+    ) -> List[DocumentSummary]:
         documents: Dict[str, DocumentSummary] = {}
         offset = None
         while True:
             points, offset = self.client.scroll(
                 collection_name=self.collection,
-                scroll_filter=qmodels.Filter(
-                    must=[
-                        qmodels.FieldCondition(
-                            key="company_id",
-                            match=qmodels.MatchValue(value=company_id),
-                        )
-                    ]
-                ),
+                scroll_filter=self._company_filter(company_id),
                 limit=256,
                 offset=offset,
                 with_payload=True,
@@ -215,9 +234,18 @@ class QdrantVectorStore(VectorStore):
             )
             for point in points:
                 payload = point.payload or {}
+                if not payload_in_scope(
+                    payload,
+                    company_id=company_id,
+                    session_id=session_id,
+                    include_company_docs=include_company_docs,
+                    document_scope=document_scope,
+                ):
+                    continue
                 document_id = str(payload.get("document_id"))
                 if document_id not in documents:
                     uploaded = payload.get("uploaded_at")
+                    scope = normalize_document_scope(payload.get("document_scope"))
                     documents[document_id] = DocumentSummary(
                         document_id=document_id,
                         company_id=company_id,
@@ -235,6 +263,8 @@ class QdrantVectorStore(VectorStore):
                         universal_chunk_count=0,
                         structured_chunk_count=0,
                         document_headings=[],
+                        document_scope=scope,  # type: ignore[arg-type]
+                        session_id=payload.get("session_id") if scope == "chat" else None,
                     )
                 summary = documents[document_id]
                 summary.chunk_count += 1
@@ -306,61 +336,44 @@ class QdrantVectorStore(VectorStore):
             )
             for point in points:
                 payload = point.payload or {}
-                uploaded = payload.get("uploaded_at")
                 chunks.append(
-                    DocumentChunk(
-                        chunk_id=str(payload.get("chunk_id")),
-                        company_id=company_id,
-                        document_id=document_id,
-                        document_name=str(payload.get("document_name")),
-                        page_number=payload.get("page_number"),
-                        section_title=payload.get("section_title"),
-                        subsection_title=payload.get("subsection_title"),
-                        chunk_index=int(payload.get("chunk_index") or 0),
-                        content=str(payload.get("content") or ""),
-                        content_hash=str(payload.get("content_hash") or ""),
-                        source_type=SourceType(payload.get("source_type") or "pdf"),
-                        source_url=payload.get("source_url"),
-                        uploaded_at=datetime.fromisoformat(uploaded)
-                        if uploaded
-                        else datetime.utcnow(),
-                        record_id=payload.get("record_id"),
-                        record_type=payload.get("record_type"),
-                        person_name=payload.get("person_name"),
-                        title=payload.get("title"),
-                        organization=payload.get("organization"),
-                        dates=payload.get("dates"),
-                        location=payload.get("location"),
-                        content_type=payload.get("content_type"),
-                        label=payload.get("label"),
-                        value=payload.get("value"),
+                    _chunk_from_payload(
+                        payload, company_id=company_id, document_id=document_id
                     )
                 )
             if offset is None:
                 break
         return sorted(chunks, key=lambda chunk: chunk.chunk_index)
 
-    async def list_payloads(self, company_id: str) -> List[Dict[str, Any]]:
+    async def list_payloads(
+        self,
+        company_id: str,
+        *,
+        session_id: Optional[str] = None,
+        include_company_docs: bool = True,
+        document_scope: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         payloads: List[Dict[str, Any]] = []
         offset = None
         while True:
             points, offset = self.client.scroll(
                 collection_name=self.collection,
-                scroll_filter=qmodels.Filter(
-                    must=[
-                        qmodels.FieldCondition(
-                            key="company_id",
-                            match=qmodels.MatchValue(value=company_id),
-                        )
-                    ]
-                ),
+                scroll_filter=self._company_filter(company_id),
                 limit=256,
                 offset=offset,
                 with_payload=True,
                 with_vectors=False,
             )
             for point in points:
-                payloads.append(point.payload or {})
+                payload = point.payload or {}
+                if payload_in_scope(
+                    payload,
+                    company_id=company_id,
+                    session_id=session_id,
+                    include_company_docs=include_company_docs,
+                    document_scope=document_scope,
+                ):
+                    payloads.append(payload)
             if offset is None:
                 break
         return payloads

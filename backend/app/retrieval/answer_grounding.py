@@ -420,8 +420,15 @@ def filter_evidence_for_answer_grounding(
 
         if intent == "employer_fee" or (
             fact_type == "price"
-            and re.search(r"(?i)\b(fee|charge\s+for|placement)\b", question or "")
             and not intent
+            and re.search(
+                r"(?i)\b("
+                r"employer|client|recruit(?:ment|ing)?|placement|staffing|"
+                r"executive\s+search|permanent\s+placement"
+                r")\b",
+                question or "",
+            )
+            and re.search(r"(?i)\b(fee|charge\s+for|cost|price)\b", question or "")
         ):
             if is_fee_process_noise_only(blob):
                 reason = "fee_process_noise_without_amount"

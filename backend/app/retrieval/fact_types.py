@@ -456,22 +456,33 @@ def filter_evidence_for_fact(
                     document_name=item.document_name or "",
                 )
             ]
-            # Strict: when the question names a service, drop currency-only mismatches.
+
+            # Service labels and fee amounts can be split across adjacent chunks.
+            # Assemble the complete fee block before document-version selection.
             if extract_requested_service_phrases(question):
-                if entity_matched:
-                    grounded, _ = filter_evidence_for_answer_grounding(
-                        entity_matched, question, fact_type=fact_type
-                    )
-                    if grounded:
-                        return grounded
-                # Service label and fee amount often sit in adjacent chunks.
                 block = collect_named_service_fee_evidence(evidence, question)
-                if block:
+
+                candidates = []
+                seen = set()
+                for item in [*entity_matched, *block]:
+                    key = (
+                        item.document_name,
+                        item.chunk_id or "",
+                        item.chunk_index,
+                        (item.content or "")[:120],
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(item)
+
+                if candidates:
                     grounded, _ = filter_evidence_for_answer_grounding(
-                        block, question, fact_type=fact_type
+                        candidates, question, fact_type=fact_type
                     )
                     return grounded
                 return []
+
             grounded, _ = filter_evidence_for_answer_grounding(
                 matched, question, fact_type=fact_type
             )

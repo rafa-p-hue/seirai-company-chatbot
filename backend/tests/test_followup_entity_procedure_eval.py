@@ -191,7 +191,6 @@ def _sources_from_message(payload: dict) -> List[str]:
             names.append(name)
     return names
 
-
 def _ask(
     client: TestClient,
     session_id: str,
@@ -209,7 +208,9 @@ def _ask(
         },
     )
     assert response.status_code == 201, response.text
-    return response.json()
+
+    payload = response.json()
+    return payload["assistant"]
 
 
 def _log_failure(label: str, payload: dict, *, question: str, follow_up: str = "") -> None:
@@ -268,6 +269,7 @@ def test_a_pet_shelter_capacity_followup(client: TestClient):
         "Which evacuation shelter accepts pets?",
         company_id=company_id,
     )
+    print("FIRST RESPONSE:", first)
     first_answer = first["content"]
     assert "greenfield" in first_answer.lower() or "accepts pets" in first_answer.lower()
 

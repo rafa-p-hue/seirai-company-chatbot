@@ -376,6 +376,18 @@ def resolve_compound_subquestions(
                 break
     if not shared_topic:
         shared_topic = extract_procedural_topic(" ".join(cleaned))
+
+    # Recover shared context from compound schedule phrases such as
+    # "volunteer orientation and when are shifts?".
+    if not shared_topic:
+        topic_match = re.search(
+            r"(?i)\b([a-z][a-z-]{2,})\s+"
+            r"(?:orientation|shifts?|schedule|hours?)\b",
+            original_question or " ".join(cleaned),
+        )
+        if topic_match:
+            shared_topic = topic_match.group(1).strip()
+
     if not shared_topic and active_domain:
         from app.retrieval.procedure_context import PROCEDURE_LABELS
 
@@ -404,6 +416,24 @@ def resolve_compound_subquestions(
             resolved.append(
                 f"What documents are required for the same {local_topic}?"
             )
+        elif (
+            shared_topic
+            and re.match(r"(?i)^when\s+(?:is|are|do|does)\b", item)
+            and re.search(r"(?i)\b(?:orientation|shifts?|schedule|hours?)\b", item)
+            and not re.search(
+                rf"(?i)\b{re.escape(shared_topic)}\b",
+                item,
+            )
+        ):
+            # Preserve the question form while restoring the shared subject:
+            # "when are shifts?" -> "when are volunteer shifts?"
+            resolved_item = re.sub(
+                r"(?i)^(when\s+(?:is|are|do|does)\s+)",
+                rf"\1{shared_topic} ",
+                item,
+                count=1,
+            )
+            resolved.append(resolved_item)
         elif query_type == "date" and (
             shared_topic
             or _is_elliptical_deadline(item)

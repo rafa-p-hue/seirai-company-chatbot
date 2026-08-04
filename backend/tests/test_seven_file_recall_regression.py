@@ -193,7 +193,8 @@ def _ask(
         },
     )
     assert response.status_code == 201, response.text
-    return response.json()
+    payload = response.json()
+    return payload["assistant"]
 
 
 def _answer(payload: dict) -> str:

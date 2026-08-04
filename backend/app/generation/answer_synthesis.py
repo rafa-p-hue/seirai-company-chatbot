@@ -485,6 +485,25 @@ def _compose_named_fee_answer(
         if re.search(r"(?i)\bpermanent\s+placement|placement\s+fee\b", service_label or ""):
             if not re.search(r"\d{1,3}(?:\.\d+)?\s*%", plain):
                 return ""
+        # Preserve multiple labeled fees for the same service instead of
+        # collapsing the answer to the first currency amount.
+        counter_match = re.search(
+            r"(?i)\bcounter\s+fee\s*:\s*"
+            r"((?:SGD|USD|EUR|GBP|AUD)\s*[\d,]+|¥[\d,]+|\$[\d,]+|[\d,]+\s*yen)",
+            plain,
+        )
+        kiosk_match = re.search(
+            r"(?i)\b(?:convenience[- ]store\s+)?kiosk\s+fee\s*:\s*"
+            r"((?:SGD|USD|EUR|GBP|AUD)\s*[\d,]+|¥[\d,]+|\$[\d,]+|[\d,]+\s*yen)",
+            plain,
+        )
+        if counter_match and kiosk_match:
+            sentence = (
+                f"The {service_label} counter fee is {counter_match.group(1)}, "
+             f"and the convenience-store kiosk fee is {kiosk_match.group(1)}."
+            )
+            return f"{sentence}{cite}"
+
         fee_match = re.search(
             r"(?i)(?:fee[^.:]*:\s*)?((?:SGD|USD|EUR|GBP|AUD)\s*[\d,]+|¥[\d,]+|\$[\d,]+)",
             plain,

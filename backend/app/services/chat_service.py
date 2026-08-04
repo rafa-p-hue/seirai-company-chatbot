@@ -426,6 +426,24 @@ class ChatService:
             )
 
         fact_type = detect_fact_type(question, understanding.query_type)
+
+        if fact_type == "price" or understanding.query_type == "price":
+            print(
+                "PRICE BEFORE FACT FILTER:",
+                [
+                    {
+                        "document": item.document_name,
+                        "status": item.document_status,
+                        "index": item.chunk_index,
+                        "section": item.section_title,
+                        "content_type": item.content_type,
+                        "content": item.content,
+                    }
+                    for item in evidence
+                ],
+                flush=True,
+            )
+
         evidence = filter_evidence_for_fact(
             evidence, fact_type, question=question
         )
@@ -452,8 +470,40 @@ class ChatService:
 
         entity_diag: Dict[str, Any] = {}
         if fact_type == "price" or understanding.query_type == "price":
+            print(
+                "PRICE SERVICE BEFORE:",
+                [
+                    {
+                        "document": item.document_name,
+                        "status": item.document_status,
+                        "index": item.chunk_index,
+                        "content": item.content,
+                    }
+                    for item in evidence
+                ],
+                flush=True,
+            )
+
             evidence, entity_diag = filter_evidence_for_requested_entity(
                 evidence, original_user_question
+            )
+
+            print(
+                "PRICE SERVICE AFTER:",
+                {
+                    "question": original_user_question,
+                    "evidence": [
+                        {
+                            "document": item.document_name,
+                            "status": item.document_status,
+                            "index": item.chunk_index,
+                            "content": item.content,
+                        }
+                        for item in evidence
+                    ],
+                    "diag": entity_diag,
+                },
+                flush=True,
             )
 
         rescue_diag: Dict[str, Any] = {}

@@ -1242,6 +1242,15 @@ class Retriever:
                 merged.append(item)
             final_items = merged[:final_k]
 
+            if understanding.query_type == "procedure":
+                final_items = _expand_exact_entity_section(
+                    final_items,
+                    payloads,
+                    question=understanding.original_question,
+                    limit=max(final_k, 8),
+                )
+
+
         # Deduplicate overview / repeated fingerprints before generation.
         final_items = _dedupe_retrieval_items(final_items, limit=final_k)
         final_items = _finalize_domain_evidence(
@@ -1633,6 +1642,225 @@ def _force_token_matches(
         reverse=True,
     )
     return matched[:4]
+
+
+
+def _expand_exact_entity_section(
+    selected_items: Sequence[Dict[str, Any]],
+    all_payloads: Sequence[Dict[str, Any]],
+    *,
+    question: str,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Prioritize the local source section containing the queried entity."""
+    from app.retrieval.entity_validation import extract_requested_service_phrases
+
+    phrases = [
+        re.sub(r"\s+", " ", phrase).strip().lower()
+        for phrase in extract_requested_service_phrases(question)
+        if phrase and phrase.strip()
+    ]
+    if not phrases or not all_payloads:
+        return list(selected_items)[:limit]
+
+    def payload_id(payload: Dict[str, Any]) -> str:
+        return str(
+            payload.get("chunk_id")
+            or payload.get("content_hash")
+            or id(payload)
+        )
+
+    def entity_matches(text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", text or "").lower()
+        return any(
+            re.search(
+                rf"(?<![a-z0-9]){re.escape(phrase)}(?:s|es)?(?![a-z0-9])",
+                normalized,
+            )
+            for phrase in phrases
+        )
+
+    matching_payloads = [
+        payload
+        for payload in all_payloads
+        if entity_matches(
+            f"{payload.get('section_title') or ''}\n"
+            f"{payload.get('content') or ''}"
+        )
+    ]
+
+    if not matching_payloads:
+        return list(selected_items)[:limit]
+
+    selected_ids = {
+        payload_id(item.get("payload") or {})
+        for item in selected_items
+    }
+
+    matching_payloads.sort(
+        key=lambda payload: (
+            1 if payload_id(payload) in selected_ids else 0,
+            1 if str(payload.get("section_title") or "").strip() else 0,
+        ),
+        reverse=True,
+    )
+    anchor = matching_payloads[0]
+
+    content = str(anchor.get("content") or "")
+    section_payloads: List[Dict[str, Any]] = []
+
+    # Slice a fused Markdown chunk from the nearest heading to the next heading.
+    lines = content.splitlines()
+    entity_line = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if entity_matches(line)
+        ),
+        None,
+    )
+
+    if entity_line is not None:
+        heading_re = re.compile(r"^\s*#{1,6}\s+(.+?)\s*$")
+        start_line = None
+        detected_heading = ""
+
+        for index in range(entity_line, -1, -1):
+            match = heading_re.match(lines[index])
+            if match:
+                start_line = index
+                detected_heading = match.group(1).strip()
+                break
+
+        if start_line is not None:
+            end_line = len(lines)
+            for index in range(entity_line + 1, len(lines)):
+                if heading_re.match(lines[index]):
+                    end_line = index
+                    break
+
+            local_text = "\n".join(lines[start_line:end_line]).strip()
+            if local_text:
+                sliced = dict(anchor)
+                sliced["content"] = local_text
+                sliced["section_title"] = detected_heading
+                sliced["chunk_id"] = f"{payload_id(anchor)}:entity-section"
+                sliced["content_hash"] = (
+                    f"{anchor.get('content_hash') or payload_id(anchor)}"
+                    ":entity-section"
+                )
+                section_payloads = [sliced]
+
+    # Fall back to all chunks sharing the document and section metadata.
+    if not section_payloads:
+        doc_key = str(
+            anchor.get("document_id")
+            or anchor.get("document_name")
+            or ""
+        ).strip().lower()
+        section_key = str(
+            anchor.get("section_title") or ""
+        ).strip().lower()
+
+        section_payloads = [
+            payload
+            for payload in all_payloads
+            if str(
+                payload.get("document_id")
+                or payload.get("document_name")
+                or ""
+            ).strip().lower()
+            == doc_key
+            and str(
+                payload.get("section_title") or ""
+            ).strip().lower()
+            == section_key
+            and str(payload.get("content_type") or "") != "heading"
+            and str(payload.get("content") or "").strip()
+        ]
+
+        section_payloads.sort(
+            key=lambda payload: int(payload.get("chunk_index") or 0)
+        )
+
+        # Start the section at the exact entity match so later evidence limits
+        # cannot discard the requested procedure behind earlier same-section
+        # content. Preserve source order from the anchor forward.
+        anchor_id = payload_id(anchor)
+        anchor_position = next(
+            (
+                index
+                for index, payload in enumerate(section_payloads)
+                if payload_id(payload) == anchor_id
+            ),
+            0,
+        )
+        section_payloads = (
+            section_payloads[anchor_position:]
+            + section_payloads[:anchor_position]
+        )
+
+    existing_items = {
+        payload_id(item.get("payload") or {}): item
+        for item in selected_items
+    }
+
+    expanded: List[Dict[str, Any]] = []
+    seen = set()
+
+    for payload in section_payloads:
+        key = payload_id(payload)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        item = existing_items.get(key)
+        if item is None:
+            item = {
+                "payload": payload,
+                "dense": 0.0,
+                "lexical": 0.0,
+                "phrase": 0.0,
+                "label_boost": 0.0,
+                "heading_boost": 0.0,
+                "numeric_boost": 0.0,
+                "exact_term_boost": 0.0,
+                "query_term_scores": {},
+                "conversation_boost": 0.0,
+                "entity_boost": 0.0,
+                "active_section_boost": 0.0,
+                "requirement_boost": 0.0,
+                "action_boost": 0.0,
+                "version_boost": 0.0,
+                "domain_boost": 0.0,
+                "title_boost": 0.0,
+                "entity_rescue": 2.1,
+                "continuity_boost": 0.0,
+                "cross_domain_penalty": 0.0,
+                "continuity_reason": "entity_section_slice",
+                "type_boost": 0.0,
+                "name_boost": 0.0,
+                "quality_boost": 0.25,
+                "quality_reason": "entity_section_slice",
+                "kv_boost": 0.0,
+                "combined": 2.1,
+                "rerank": 2.1,
+            }
+
+        expanded.append(item)
+        if len(expanded) >= limit:
+            return expanded
+
+    for item in selected_items:
+        key = payload_id(item.get("payload") or {})
+        if key in seen:
+            continue
+        seen.add(key)
+        expanded.append(item)
+        if len(expanded) >= limit:
+            break
+
+    return expanded
 
 
 def _dedupe_retrieval_items(

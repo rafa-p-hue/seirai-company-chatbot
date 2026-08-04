@@ -672,10 +672,31 @@ def relevant_price_evidence(
                 document_name=item[1].document_name or "",
             )
         ]
-        if entity_ok:
-            return entity_ok
-        # Fee schedules often split "Service: X" from "Fee: N%" across chunks.
+        # Fee schedules often split the service label from one or more fee rows.
+        # Keep direct entity matches together with their recovered sibling rows.
         block = collect_named_service_fee_evidence(evidence, question)
+
+        if entity_ok:
+            block_keys = {
+                (c.document_name, (c.content or "")[:160])
+                for c in block
+            }
+
+            combined = []
+            seen = set()
+            for item in [*entity_ok, *selected]:
+                key = (
+                    item[1].document_name,
+                    (item[1].content or "")[:160],
+                )
+                if key in seen:
+                    continue
+                if item in entity_ok or key in block_keys:
+                    combined.append(item)
+                    seen.add(key)
+
+            return combined
+
         if not block:
             return []
         block_keys = {

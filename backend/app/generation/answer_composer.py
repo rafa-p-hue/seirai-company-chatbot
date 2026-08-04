@@ -1151,6 +1151,32 @@ def _price_from_evidence(
     filtered, diag = filter_evidence_for_requested_entity(
         evidence, understanding.original_question
     )
+    print(
+        "PRICE DEBUG:",
+        {
+            "question": understanding.original_question,
+            "input": [
+                {
+                    "document": item.document_name,
+                    "status": item.document_status,
+                    "index": item.chunk_index,
+                    "content": item.content,
+                }
+                for item in evidence
+            ],
+            "filtered": [
+                {
+                    "document": item.document_name,
+                    "status": item.document_status,
+                    "index": item.chunk_index,
+                    "content": item.content,
+                }
+                for item in filtered
+            ],
+            "diag": diag,
+        },
+        flush=True,
+    )
     if not filtered:
         import logging
 
@@ -1474,13 +1500,29 @@ def _specific_from_evidence(
                 # Named shelter + pet-friendly attribute is sufficient evidence.
                 shelter_name = None
                 name_match = re.search(
-                    r"(?i)\b([A-Z][A-Za-z0-9 .'-]{2,60}?"
+                    r"\b([A-Z][A-Za-z0-9 .'-]{2,60}?"
                     r"(?:Community Center|School(?: Gymnasium)?|Shelter|"
                     r"Junior High|Elementary)[A-Za-z0-9 .'-]*)",
                     part,
                 )
                 if name_match:
-                    shelter_name = name_match.group(1).strip(" -—,")
+                    candidate_name = name_match.group(1).strip(" -—,")
+                    # Generic labels annerated summaries are not entity names.
+                    if not re.search(
+                        r"(?i)\b(summary|overview|guide|information)\b",
+                        candidate_name,
+                    ):
+                        shelter_name = candidate_name
+
+                if (
+                    pet_friendly
+                    and shelter_name is None
+                    and re.search(
+                        r"(?i)\b(?:shelter|pet[- ]friendly)\s+summary\b",
+                        part,
+                    )
+                ):
+                    continue
                 if pet_friendly and shelter_name:
                     snippet = (
                         f"{shelter_name} has a pet-friendly area."
@@ -1596,7 +1638,9 @@ def _specific_from_evidence(
                 token in (item.content or "").lower() for token in query_tokens
             ):
                 # Never return bare Label: value for claim questions.
-                if understanding.query_type in {
+                # For these intents, fall through and score the full sentence
+                # below instead of discarding the entire evidence chunk.
+                if understanding.query_type not in {
                     "awards",
                     "executive",
                     "instrument",
@@ -1605,8 +1649,11 @@ def _specific_from_evidence(
                     "location",
                     "policy",
                 }:
-                    continue
-                return f"{item.label}: {item.value}." if item.label else f"{item.value}."
+                    return (
+                        f"{item.label}: {item.value}."
+                        if item.label
+                        else f"{item.value}."
+                    )
         for part in re.split(r"(?<=[.!?])\s+|\n+", item.content or ""):
             text = re.sub(r"\s+", " ", part).strip(" -•\t[]")
             if len(text) < 8:

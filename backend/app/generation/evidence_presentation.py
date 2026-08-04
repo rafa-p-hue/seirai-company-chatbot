@@ -552,12 +552,12 @@ def expand_sentence_boundaries(
             primary = ordered[i]
             fused = (primary.content or "").strip()
             j = i
-            # Atomic table/CSV rows are never fused with siblings.
+            # Atomic table/CSV rows are complete records, even when their
+            # internal field keys begin with lowercase letters.
             if _is_atomic_structured_row(primary):
-                fused = repair_passage_text(
-                    fused, section_title=primary.section_title
+                expanded.append(
+                    primary.model_copy(update={"content": fused.strip()})
                 )
-                expanded.append(primary.model_copy(update={"content": fused}))
                 i = j + 1
                 continue
             # Pull following siblings while either side is mid-sentence.
@@ -675,12 +675,14 @@ def prepare_evidence_for_generation(
     merged = merge_procedure_evidence(expanded)
     prepared: List[RetrievedChunk] = []
     for chunk in merged:
-        content = repair_passage_text(
-            chunk.content or "",
-            section_title=chunk.section_title,
-        )
-        if looks_like_structured_record(content, chunk):
-            content = format_structured_content_as_prose(content, chunk)
+        raw = chunk.content or ""
+        if looks_like_structured_record(raw, chunk):
+            content = format_structured_content_as_prose(raw, chunk)
+        else:
+            content = repair_passage_text(
+                raw,
+                section_title=chunk.section_title,
+            )
         prepared.append(chunk.model_copy(update={"content": content}))
     return prepared
 
